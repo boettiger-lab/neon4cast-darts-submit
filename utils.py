@@ -90,15 +90,107 @@ def make_stitched_series(site_dict):
 
     return stitched_series
 
+def global_model_preprocess(targets, stitched_dictionary):
+    # Creating a dictionary of dictionaries indexed by site with
+    # nested value being the stitched time series
+    named_ts_dict = {}
+    site_names = targets["site_id"].unique()
+    for index, item in enumerate(time_series):
+        name = site_names[index]
+        named_ts_dict[name] = item
 
-def train_models(site_id, targets):
-    """
-    Returns a dictionary {site_id: [ml_model, scaled validation inputs, scaled validation covariates, scaler]}
-    """
-    #Note site_stitched is a dictionary {"var": tseries}
-    site_stitched = make_stitched_series(site_id, targets)
+    # Now 
+    inputs_covs_dict = {}
+    inputs_training = []
+    covs_training = []
+    for name in site_names:
+        # Accessing the dictionary of every site, then going through each
+        # time series recorded at that site
+        site_dict = named_ts_dict[name]
+        site_variables = list(site_dict.keys())
+        variables_main = ["oxygen", "chla", "temperature"]
+        variable_dict = {}
+        for index, variable in enumerate(variables_main):
+            variables_sub = ["oxygen", "chla", "temperature"]
+            # Checking to see if the site has data for a variable
+            if variable in site_variables:
+                # If so I remove that variable on this dummy list
+                # and then try to create covariate TS
+                variables_sub.pop(index) 
+                covs = []
+                # Here I find covariates that were recorded at the
+                # site
+                for cov_variable in variables_sub:
+                    if cov_variable in site_variables:
+                        covs.append(cov_variable)
+                variables_sub.append(variable)
+                # Then if there is more than one covariate, I stack them
+                if len(covs) == 2:
+                    cov_sup = site_dict[covs[0]]
+                    cov_sub = site_dict[covs[1]]
+                    cov = cov_sub.concatenate(cov_sup, axis=1, ignore_time_axis=True)
+                    variable_value = [site_dict[variable], cov]
+                elif len(covs) == 1:
+                    cov = site_dict[covs[0]]
+                    # I add a dummy covariate so that all covariates have same shape
+                    shape = (cov.n_timesteps, cov.n_components, cov.n_samples)
+                    null_array = np.zeros(shape)
+                    dummy_cov = TimeSeries.from_times_and_values(cov.time_index, null_array)
+                    cov = cov.concatenate(dummy_cov, axis=1, ignore_time_axis=True)
+                    variable_value = [site_dict[variable], cov]
+                # Making the decision that if there are no covariates, don't add to the dictionary
+                # Finally, we put the entry together for the dictionary
+                variable_dict[variable] = variable_value
+                inputs_training.append(site_dict[variable])
+                covs_training.append(cov)
+        inputs_covs_dict[name] = variable_dict
 
-    models = {} 
+    # Splitting training set and validation set
+    val_split = pd.Timestamp(year=2023, month=1, day=1)
+    
+    val_set = []
+    inputs = []
+    cov_set = []
+    for index in range(len(inputs_training)):
+        input = inputs_training[index]
+        cov = covs_training[index]
+        try:
+            train_inp, val_inp = input.split_before(val_split)    
+        except:
+            continue
+        inputs.append(train_inp)
+        val_set.append(val_inp)
+        cov_set.append(cov)
+
+    return inputs, val_set, cov_set
+
+@ray.remote(num_gpus=1)
+def train_global_model(inputs, cov_set):
+    rnn = BlockRNNModel(model="LSTM",
+                                hidden_dim=256,
+                                batch_size=8,
+                                input_chunk_length=15,
+                                output_chunk_length=34,
+                                likelihood=LaplaceLikelihood(),
+                                optimizer_kwargs={"lr": 1e-4},
+                                n_rnn_layers=3,
+                                random_state=0)
+    
+    rnn.fit(inputs,
+            past_covariates=cov_set,
+            epochs=250, 
+            verbose=False)
+
+    return rnn
+
+def train_local_model(site_id, site_stitched_dict, site_models_dict):
+    """
+    Returns a dictionary {site_id: [ml_model, 
+                                    scaled validation inputs, 
+                                    scaled validation covariates, 
+                                    scaler]}
+    """
+    site_stitched = site_stitched_dict[site_id]
 
     for var in site_stitched.keys():
         rnn = BlockRNNModel(model="LSTM",
@@ -113,8 +205,11 @@ def train_models(site_id, targets):
         
         # Set a date to split between train and validation set
         val_split = pd.Timestamp(year=2023, month=1, day=1)
-        train_set, val_set = site_stitched[var].split_before(val_split)
-
+        try:
+            train_set, val_set = site_stitched[var].split_before(val_split)
+        except:
+            continue
+        
         scaler = Scaler()
         train_scaled = scaler.fit_transform(train_set)
         val_scaled = scaler.transform(val_set)
@@ -130,7 +225,9 @@ def train_models(site_id, targets):
         else:
             scaled_cov0 = scaler.transform(site_stitched[covariate_list[0]])
             scaled_cov1 = scaler.transform(site_stitched[covariate_list[1]])
-            covariates = scaled_cov0.stack(scaled_cov1)
+            covariates = scaled_cov0.concatenate(scaled_cov1, 
+                                                 axis=1, 
+                                                 ignore_time_axis=True)
 
         # Now training model
         rnn.fit(train_scaled,
@@ -138,6 +235,40 @@ def train_models(site_id, targets):
                 epochs=250, 
                 verbose=False)
     
-        models[var] = [rnn, val_scaled, covariates, scaler]
+        site_models_dict[site_id].update({var: [rnn, val_scaled, covariates, scaler]})
 
-    return models
+    return
+
+def make_plot(model, inputs, input_num, cov_set, val_set):
+    plt.clf()
+    preds = model.predict(series=inputs[input_num], 
+                               past_covariates=cov_set[input_num], 
+                               n=30,#len(val_set[input_num]),
+                               num_samples=50)
+    preds.plot(label="forecast")
+    val_set[input_num][:30].plot(label="truth")
+    plt.show()
+
+def make_plot_long_horizon(model, inputs, input_num, cov_set, val_set):
+    plt.clf()
+    preds = model.predict(series=inputs[input_num], 
+                               past_covariates=cov_set[input_num], 
+                               n=len(val_set[input_num]),
+                               num_samples=50)
+    preds.plot(label="forecast")
+    val_set[input_num].plot(label="truth")
+    plt.show()
+
+def make_plot_local(site, variable, site_models_dict):
+    plt.clf()
+    site_dict = site_models_dict[site]
+    model_ = site_dict[variable][0]
+    val_set_ = site_dict[variable][1]
+    covs_ = site_dict[variable][2]
+    scaler = site_dict[variable][-1]
+    predictions_ = model_.predict(n=len(val_set_), past_covariates=covs_, num_samples=50)
+    preds = scaler.inverse_transform(predictions_)
+    preds.plot()
+    val_set = scaler.inverse_transform(val_set_)
+    val_set.plot(label="truth")
+    plt.show()
