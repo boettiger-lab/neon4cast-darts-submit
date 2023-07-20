@@ -107,6 +107,12 @@ class TimeSeriesPreprocessor():
         self.sites_dict[site] = stitched_series_dict
         self.sites_dict_null[site] = keys_to_remove
 
+    def plot_by_site(self, site):
+        for key in self.sites_dict[site].keys():
+            plt.clf()
+            self.sites_dict[site][key].plot(label=f"{key} @ {site}")
+            plt.show()
+
 class BaseForecaster():
     def __init__(self,
                  model: Optional[str] = None,
