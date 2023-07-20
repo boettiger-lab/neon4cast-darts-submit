@@ -26,40 +26,17 @@ import numpy as np
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
-class BaseForecaster():
+class TimeSeriesPreprocessor():
     def __init__(self,
-                 model: Optional[str] = None,
-                 input_csv_name: Optional[str] = None,
-                 target_variable_column_name: Optional[str] = None,
-                 datetime_column_name: Optional[str] = None,
+                 input_csv_name = "targets.csv.gz",
+                 datetime_column_name: Optional[str] = "datetime",
                  covariates_names: Optional[list] = None,
-                 output_csv_name: Optional[str] = "residual_forecaster_output.csv",
-                 validation_split_date: Optional[str] = None, #YYYY-MM-DD
-                 model_hyperparameters: Optional[dict] = None,
-                 forecast_horizon: Optional[int] = 30,
-                 site_id: Optional[str] = None,
                  ):
-        self.model_ = {"BlockRNN": BlockRNNModel, 
-                       "TCN": TCNModel, 
-                       "RNN": RNNModel, 
-                       "Transformer": TransformerModel,
-                       "NLinear": NLinearModel,
-                       "NBEATS": NBEATSModel}[model]
         self.input_csv_name = input_csv_name
         self.df = pd.read_csv(self.input_csv_name)
-        self. df = self.df.loc[self.df.site_id == site_id]
-        self.target_variable_column_name = target_variable_column_name
         self.datetime_column_name = datetime_column_name
-        self.covariates_names = covariates_names
-        self.output_csv_name = output_csv_name
-        self.validation_split_date = validation_split_date
-        self.forecast_horizon = forecast_horizon
-        if model_hyperparameters == None:
-            self.hyperparams = {"input_chunk_length" : 180}
-        else:
-            self.hyperparams = model_hyperparameters
-
-        self._preprocess_data()
+        self.sites_dict = {}
+        self.sites_dict_null = {}
     
     def make_stitched_series(self, variable_tseries):
         """
@@ -103,32 +80,83 @@ class BaseForecaster():
                                                 -1))
         
         return stitched_series
-        
-    def _preprocess_data(self):
+
+    def preprocess_data(self, site):
         """
         Performs gap filling and processing of data into format that
         Darts models will accept
         """
-        times = pd.to_datetime(self.df[self.datetime_column_name])
+        site_df = self.df.loc[self.df.site_id == site]
+        times = pd.to_datetime(site_df[self.datetime_column_name])
         times = pd.DatetimeIndex(times)
-        variable_list = self.covariates_names + [self.target_variable_column_name]
-        
+        variable_list = ["chla", "oxygen", "temperature", "air_tmp"]
         var_series_dict = {var: TimeSeries.from_times_and_values(times, 
-                                                                 self.df[var], 
+                                                                 site_df[var], 
                                                                  fill_missing_dates=True,
                                                                  freq="D") 
                                                         for var in variable_list}
 
         stitched_series_dict = {var: self.make_stitched_series(var_series_dict[var])
                                                     for var in variable_list}
+
+        # Deleting keys with none values
+        keys_to_remove = [key for key, value in stitched_series_dict.items() if value == None]
+        for key in keys_to_remove:
+            del stitched_series_dict[key]
+
+        self.sites_dict[site] = stitched_series_dict
+        self.sites_dict_null[site] = keys_to_remove
+
+class BaseForecaster():
+    def __init__(self,
+                 model: Optional[str] = None,
+                 data_preprocessor: Optional = None,
+                 target_variable_column_name: Optional[str] = None,
+                 datetime_column_name: Optional[str] = None,
+                 covariates_names: Optional[list] = None,
+                 output_csv_name: Optional[str] = "residual_forecaster_output.csv",
+                 validation_split_date: Optional[str] = None, #YYYY-MM-DD
+                 model_hyperparameters: Optional[dict] = None,
+                 forecast_horizon: Optional[int] = 30,
+                 site_id: Optional[str] = None,
+                 ):
+        self.model_ = {"BlockRNN": BlockRNNModel, 
+                       "TCN": TCNModel, 
+                       "RNN": RNNModel, 
+                       "Transformer": TransformerModel,
+                       "NLinear": NLinearModel,
+                       "NBEATS": NBEATSModel}[model]
+        self.data_preprocessor = data_preprocessor
+        self.target_variable_column_name = target_variable_column_name
+        self.datetime_column_name = datetime_column_name
+        self.covariates_names = covariates_names
+        self.output_csv_name = output_csv_name
+        self.validation_split_date = validation_split_date
+        self.forecast_horizon = forecast_horizon
+        self.site_id = site_id
+        if model_hyperparameters == None:
+            self.hyperparams = {"input_chunk_length" : 180}
+        else:
+            self.hyperparams = model_hyperparameters
+
+        self._preprocess_data()
+        
+    def _preprocess_data(self):
+        """
+        Performs gap filling and processing of data into format that
+        Darts models will accept
+        """
+        stitched_series_dict = self.data_preprocessor.sites_dict[self.site_id]
+
+        # If there was failure when doing the GP fit then we can't do preprocessing
+        if self.target_variable_column_name in \
+                self.data_preprocessor.sites_dict_null[self.site_id]:
+            return "Cannot fit this target time series as no GP fit was performed."
         self.inputs = stitched_series_dict[self.target_variable_column_name]
 
-        # Some time series can't be fitted with GP, often cause there's no data
-        for key, value in stitched_series_dict.copy().items():
-            if value == None:
-                print(f"Failed to make a GP fit on {key}")
-                del stitched_series_dict[key]
-                self.covariates_names.remove(key)
+        # And not using the covariates that did not yield GP fits beforehand
+        for null_variable in self.data_preprocessor.sites_dict_null[self.site_id]:
+            self.covariates_names.remove(null_variable)
             
         # Initializing covariates list then concatenating in for loop
         self.covariates = stitched_series_dict[self.covariates_names[0]]
@@ -136,7 +164,6 @@ class BaseForecaster():
             self.covariates = self.covariates.concatenate(stitched_series_dict[cov_var], 
                                                           axis=1, 
                                                           ignore_time_axis=True)
-
         # Splitting training and validation set
         year = int(self.validation_split_date[:4])
         month = int(self.validation_split_date[5:7])
@@ -262,7 +289,6 @@ class BaseForecaster():
                    "observed": block_rnn_forecaster.historical_ground_truth.pd_dataframe()}
         for variable, df in df_dict.items():
             df.to_csv(f"{self.model}_test/{variable}")
-        
     
 
 class ResidualForecasterDarts():
