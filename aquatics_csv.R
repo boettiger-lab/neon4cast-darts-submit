@@ -7,15 +7,15 @@ neon <- s3_bucket("neon4cast-targets/neon",
                   anonymous = TRUE)
 
 
-# we select the TAAT_30min table by using its full name
-remote_taat <- open_dataset(neon$path("TAAT_30min-basic-DP1.00003.001"))
+# we select the RH table by using its full name, this also contains air temp
+# for aquatics sites
+remote_taat <- open_dataset(neon$path("RH_30min-basic-DP1.00098.001"))
 
 
-## Triple-aspirated temperature:
 neon_temp <- remote_taat |>
   mutate(time = as.Date(startDateTime)) |>
   group_by(siteID, time) |>
-  summarise(air_tmp = mean(tempTripleMean, na.rm = TRUE)) |>
+  summarise(air_tmp = mean(tempRHMean, na.rm = TRUE)) |>
   rename(site_id = siteID) |>
   rename(datetime = time) |>
   collect()
