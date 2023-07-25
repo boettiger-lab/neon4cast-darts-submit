@@ -270,13 +270,10 @@ class BaseForecaster():
             self.scaler = Scaler()
             training_set, covariates = self.scaler.fit_transform([self.training_set,
                                                                   self.covariates])
-            # Need to treat XGB and Linear Regression models differently than networks
+            # Don't need to tune XGB and linear regression models
             extras = {"past_covariates": covariates,
                       "verbose": False,
                       "epochs": 500}
-            if self.model_ == XGBModel or self.model_ == LinearRegressionModel:
-                del extras["epochs"]
-                del extras["verbose"]
         
             self.model.fit(training_set,
                            **extras)
