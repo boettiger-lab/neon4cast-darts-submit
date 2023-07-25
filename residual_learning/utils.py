@@ -12,8 +12,11 @@ from darts.models import (
                           TCNModel, 
                           RNNModel, 
                           TransformerModel, 
-                          NLinearModel, 
-                          NBEATSModel
+                          NLinearModel,
+                          DLinearModel,
+                          NBEATSModel,
+                          XGBModel,
+                          LinearRegressionModel,
                          )
 from darts.utils.likelihood_models import QuantileRegression
 from darts.dataprocessing.transformers import Scaler
@@ -107,12 +110,75 @@ class TimeSeriesPreprocessor():
         self.sites_dict[site] = stitched_series_dict
         self.sites_dict_null[site] = keys_to_remove
 
+    def save(self):
+        # Check if there's a dir already
+        if not os.path.exists("preprocessed_timeseries/"):
+            os.makedirs("preprocessed_timeseries/")
+
+        # Saving each TimeSeries
+        for site in self.sites_dict.keys():
+            for variable in self.sites_dict[site]:
+                self.sites_dict[site][variable].pd_dataframe()\
+                    .to_csv(f"preprocessed_timeseries/{site}_{variable}.csv")
+
+    def load(self):
+        # Need to check what are the possible variables that there could be in null, 
+        # and when you load a series need to log which ones aren't added
+        variables = {"chla", "oxygen", "temperature", "air_tmp"}
+        sites_dict_present = {}
+        
+        # Need to fill sites_dict and sites_dict_null
+        dir_path = "preprocessed_timeseries/"
+        files = os.listdir(dir_path)
+        for file in files:
+            if file.endswith(".csv"):
+                # Reading in file name; this is bad practice here, I should redo 
+                # naming convention
+                try:
+                    site, variable = file.replace(".csv", "").split("_")
+                except:
+                    site, var1, var2 = file.replace(".csv", "").split("_")
+                    variable = var1 + "_" + var2
+                file_path = os.path.join(dir_path, file)
+                df = pd.read_csv(file_path)
+    
+                # To make a time series, need to isolate time index and values
+                times = pd.to_datetime(df["datetime"])
+                times = pd.DatetimeIndex(times)
+                values = df.loc[:, df.columns!="datetime"].to_numpy()\
+                        .reshape((-1, 1, 500))
+                time_series = TimeSeries.from_times_and_values(times, 
+                                                               values, 
+                                              fill_missing_dates=True, 
+                                                             freq="D")
+    
+                # Initialize the site dict entry if one doesn't exist already
+                if site not in self.sites_dict.keys():
+                    self.sites_dict[site] = {}
+                self.sites_dict[site][variable] = time_series
+    
+                # Need to keep track of the variables over different csv's
+                # for each site
+                if site not in sites_dict_present.keys():
+                    sites_dict_present[site] = [variable]
+                else:
+                    sites_dict_present[site].append(variable)
+    
+    
+        for site in sites_dict_present.keys():
+            variables_present = set(sites_dict_present[site])
+            absent_variables = list(variables - variables_present)
+            self.sites_dict_null[site] = absent_variables
+    
     def plot_by_site(self, site):
         for key in self.sites_dict[site].keys():
             plt.clf()
-            self.sites_dict[site][key].plot(label=f"{key} @ {site}")
+            self.sites_dict[site][key].plot(color="blue", label=f"{key} @ {site}")
             plt.show()
 
+#@ray.remote
+# For likelihood/quantile distinction throw an if statement for xgb, linear regression model case, otherwise
+# assume use of Quantile and Gaussian Likelihood
 class BaseForecaster():
     def __init__(self,
                  model: Optional[str] = None,
@@ -123,6 +189,7 @@ class BaseForecaster():
                  output_csv_name: Optional[str] = "residual_forecaster_output.csv",
                  validation_split_date: Optional[str] = None, #YYYY-MM-DD
                  model_hyperparameters: Optional[dict] = None,
+                 model_likelihood: Optional[dict] = None,
                  forecast_horizon: Optional[int] = 30,
                  site_id: Optional[str] = None,
                  ):
@@ -131,7 +198,10 @@ class BaseForecaster():
                        "RNN": RNNModel, 
                        "Transformer": TransformerModel,
                        "NLinear": NLinearModel,
-                       "NBEATS": NBEATSModel}[model]
+                       "DLinear": DLinearModel,
+                       "XGB": XGBModel,
+                       "NBEATS": NBEATSModel,
+                       "Linear": LinearRegressionModel,}[model]
         self.data_preprocessor = data_preprocessor
         self.target_variable_column_name = target_variable_column_name
         self.datetime_column_name = datetime_column_name
@@ -144,6 +214,7 @@ class BaseForecaster():
             self.hyperparams = {"input_chunk_length" : 180}
         else:
             self.hyperparams = model_hyperparameters
+        self.model_likelihood = model_likelihood
 
         self._preprocess_data()
         
@@ -194,7 +265,7 @@ class BaseForecaster():
         
             model = self.model_(**hyperparams,
                                 output_chunk_length=self.forecast_horizon,
-                                likelihood=QuantileRegression([0.05, 0.1, 0.5, 0.9, 0.95]))
+                                **self.model_likelihood)
             
             self.scaler = Scaler()
             training_set, covariates = self.scaler.fit_transform([self.training_set,
@@ -218,7 +289,7 @@ class BaseForecaster():
 
         study = optuna.create_study(direction="minimize")
         
-        study.optimize(objective, n_trials=3) # Note 10 trials pretty meaningless here
+        study.optimize(objective, n_trials=50) # Note 10 trials pretty meaningless here
         
         self.hyperparams = study.best_trial.params
 
@@ -229,15 +300,21 @@ class BaseForecaster():
         print(self.hyperparams)
         self.model = self.model_(**self.hyperparams,
                                  output_chunk_length=self.forecast_horizon,
-                                 likelihood=QuantileRegression([0.05, 0.1, 0.5, 0.9, 0.95]),
+                                 **self.model_likelihood,
                                  random_state=0)
         self.scaler = Scaler()
         training_set, covariates = self.scaler.fit_transform([self.training_set,
                                                               self.covariates])
+        # Need to treat XGB and Linear Regression models differently than networks
+        extras = {"past_covariates": covariates,
+                  "verbose": False,
+                  "epochs": 500}
+        if self.model_ == XGBModel or self.model_ == LinearRegressionModel:
+            del extras["epochs"]
+            del extras["verbose"]
+    
         self.model.fit(training_set,
-                       past_covariates=covariates,
-                       epochs=500, 
-                       verbose=False)
+                       **extras)
 
         predictions = self.model.predict(n=self.forecast_horizon,
                                          past_covariates=covariates, 
@@ -295,8 +372,14 @@ class BaseForecaster():
                    "observed": block_rnn_forecaster.historical_ground_truth.pd_dataframe()}
         for variable, df in df_dict.items():
             df.to_csv(f"{self.model}_test/{variable}")
-    
 
+    def plot_by_site(self, site):
+        for key in self.sites_dict[site].keys():
+            plt.clf()
+            self.sites_dict[site][key].plot(color="blue", label=f"{key} @ {site}")
+            plt.show()
+    
+@ray.remote
 class ResidualForecasterDarts():
     def __init__(self,
                  historical_forecasts: Optional[TimeSeries] = None,
@@ -407,7 +490,7 @@ class ResidualForecasterDarts():
 
         study = optuna.create_study(direction="minimize")
         
-        study.optimize(objective, n_trials=3) # INCREASE NUMBER OF TRIALS LATER ON
+        study.optimize(objective, n_trials=50) # INCREASE NUMBER OF TRIALS LATER ON
         
         # I save the best hyperparameters to the object self.hyperparameter so that these
         # hyperparameters can be easily referend in the future
