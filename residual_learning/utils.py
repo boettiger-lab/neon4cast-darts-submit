@@ -270,10 +270,16 @@ class BaseForecaster():
             self.scaler = Scaler()
             training_set, covariates = self.scaler.fit_transform([self.training_set,
                                                                   self.covariates])
-            model.fit(training_set,
-                      past_covariates=covariates,
-                      epochs=400, 
-                      verbose=False)
+            # Need to treat XGB and Linear Regression models differently than networks
+            extras = {"past_covariates": covariates,
+                      "verbose": False,
+                      "epochs": 500}
+            if self.model_ == XGBModel or self.model_ == LinearRegressionModel:
+                del extras["epochs"]
+                del extras["verbose"]
+        
+            self.model.fit(training_set,
+                           **extras)
         
             predictions = model.predict(n=len(self.validation_set[:self.forecast_horizon]), 
                                             past_covariates=covariates, 
