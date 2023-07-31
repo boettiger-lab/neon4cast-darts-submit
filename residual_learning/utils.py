@@ -43,9 +43,8 @@ def crps(forecast, ground_truth):
         for sample in day_forecast:
             crps_lh = 1/n * np.abs(sample - day_ground_truth)
             crps_rh = sum([-1/(2 * n **2) * np.abs(sample - x) for x in day_forecast])
-
-            crps_sample = crps_lh + crps_rh
-            crps_day += crps_sample
+ 
+            crps_day += crps_lh + crps_rh
 
         crps.append(crps_day)
 
