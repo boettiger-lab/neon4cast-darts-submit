@@ -29,6 +29,31 @@ import numpy as np
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
+def crps(forecast, ground_truth):
+    """
+    Returns an array of CRPS scores 
+    """
+    crps = []
+    for i, day_forecast_ in enumerate(forecast):
+        # Indexing and transforming forecast and ground truth for each day
+        day_ground_truth = ground_truth[i].median().univariate_values()[0]
+        day_forecast = day_forecast_.all_values()[0][0]
+        n = len(day_forecast)
+        crps_day = 0
+        for sample in day_forecast:
+            crps_lh = 1/n * np.abs(sample - day_ground_truth)
+            crps_rh = sum([-1/(2 * n **2) * np.abs(sample - x) for x in day_forecast])
+
+            crps_sample = crps_lh + crps_rh
+            crps_day += crps_sample
+
+        crps.append(crps_day)
+
+    crps_ts = TimeSeries.from_times_and_values(forecast.time_index, 
+                                               np.array(crps), 
+                                               fill_missing_dates=True, freq="D")
+    return crps_ts
+
 class TimeSeriesPreprocessor():
     def __init__(self,
                  input_csv_name = "targets.csv.gz",
@@ -119,7 +144,7 @@ class TimeSeriesPreprocessor():
         for site in self.sites_dict.keys():
             for variable in self.sites_dict[site]:
                 self.sites_dict[site][variable].pd_dataframe()\
-                    .to_csv(f"preprocessed_timeseries/{site}_{variable}.csv")
+                    .to_csv(f"preprocessed_timeseries/{site}-{variable}.csv")
 
     def load(self):
         # Need to check what are the possible variables that there could be in null, 
@@ -135,7 +160,7 @@ class TimeSeriesPreprocessor():
                 # Reading in file name; this is bad practice here, I should redo 
                 # naming convention
                 try:
-                    site, variable = file.replace(".csv", "").split("_")
+                    site, variable = file.replace(".csv", "").split("_") # Change this to split at "-"
                 except:
                     site, var1, var2 = file.replace(".csv", "").split("_")
                     variable = var1 + "_" + var2
@@ -177,8 +202,6 @@ class TimeSeriesPreprocessor():
             plt.show()
 
 #@ray.remote
-# For likelihood/quantile distinction throw an if statement for xgb, linear regression model case, otherwise
-# assume use of Quantile and Gaussian Likelihood
 class BaseForecaster():
     def __init__(self,
                  model: Optional[str] = None,
