@@ -21,6 +21,7 @@ from darts.models import (
 from darts.utils.likelihood_models import QuantileRegression
 from darts.dataprocessing.transformers import Scaler
 from darts.metrics import smape
+from datetime import datetime, timedelta
 import ray
 import os
 import optuna
@@ -53,13 +54,98 @@ def crps(forecast, ground_truth):
                                                fill_missing_dates=True, freq="D")
     return crps_ts
 
+class HistoricalForecaster():
+    def __init__(self,
+                 data_preprocessor: Optional = None,
+                 output_csv_name: Optional[str] = "historical_forecaster_output.csv",
+                 validation_split_date: Optional[str] = None, #YYYY-MM-DD
+                 forecast_horizon: Optional[int] = 30,
+                 site_id: Optional[str] = None,
+                 target_variable: Optional[str] = None,
+                 ):
+        self.data_preprocessor = data_preprocessor
+        self.output_csv_name = output_csv_name
+        self.validation_split_date = validation_split_date
+        self.forecast_horizon = forecast_horizon
+        self.site_id = site_id
+        self.target_variable = target_variable
+        self._preprocess_data()
+
+    def _preprocess_data(self):
+        stitched_series_dict = self.data_preprocessor.sites_dict[self.site_id]
+        # If there was failure when doing the GP fit then we can't do preprocessing
+        if self.target_variable in \
+                self.data_preprocessor.sites_dict_null[self.site_id]:
+            return "Cannot fit this target time series as no GP fit was performed."
+        self.inputs = stitched_series_dict[self.target_variable]
+
+        # Splitting training and validation set
+        self.year = int(self.validation_split_date[:4])
+        month = int(self.validation_split_date[5:7])
+        day = int(self.validation_split_date[8:])
+        split_date = pd.Timestamp(year=self.year, month=month, day=day)
+        self.training_set, self.validation_set = self.inputs.split_before(split_date)
+
+    def make_forecasts(self):
+        """
+        This function finds the historical mean and var, and uses these statistics for
+        the forecast
+        """
+        # Using the medians of the GP filter
+        median_df = data_preprocessor.sites_dict[self.site_id]\
+                        [self.target_variable].median().pd_dataframe()
+        median_df["timestamp"] = pd.to_datetime(median_df.index)
+        median_df["day_of_year"] = median_df["timestamp"].dt.dayofyear
+        
+        # Computing average and std for doy's 
+        doy_df = median_df.groupby(['day_of_year'])['0'].agg(['mean', 'std'])
+        
+        # Filtering the previously computed averages and std for our dates of interest
+        forecast_doys = pd.date_range(start=self.validation_split_date, 
+                                      periods=self.forecast_horizon, 
+                                      freq='D').dayofyear
+        forecast_df = doy_df.loc[forecast_doys]
+
+        # Function to give date from the numerical doy
+        def day_of_year_to_date(year, day_of_year):
+            base_date = datetime(year, 1, 1)
+            target_date = base_date + timedelta(days=day_of_year - 1)
+            return target_date
+
+        samples = np.array([np.random.normal(doy_df.loc[doy_df.index == doy]["mean"],
+                                    doy_df.loc[doy_df.index == doy]["std"]/2,
+                                    size=(1, 500)) for doy in forecast_df.index])
+
+        # Now creating an index going from doy to date
+        date_index = [day_of_year_to_date(self.year, day) for day in forecast_df.index]
+        forecast_df.index = date_index
+
+        
+        self.forecast_df = forecast_df
+        self.forecast_ts = TimeSeries.from_times_and_values(forecast_df.index, samples)
+
+    def plot(self):
+        fig, ax1 = plt.subplots()
+        ax1.plot(self.forecast_df.index, 
+                 self.forecast_df["mean"], 
+                 label="historical",
+                 linewidth=2)
+        ax1.fill_between(self.forecast_df.index, 
+                         self.forecast_df["mean"] - self.forecast_df["std"], 
+                         self.forecast_df["mean"] + self.forecast_df["std"],
+                         alpha=0.2,)
+        fig.autofmt_xdate()
+        plt.legend()
+
 class TimeSeriesPreprocessor():
     def __init__(self,
                  input_csv_name = "targets.csv.gz",
+                 load_dir_name: Optional[str] = "preprocessed_timeseries/",
                  datetime_column_name: Optional[str] = "datetime",
                  covariates_names: Optional[list] = None,
                  ):
         self.input_csv_name = input_csv_name
+        self.load_dir_name = load_dir_name
         self.df = pd.read_csv(self.input_csv_name)
         self.datetime_column_name = datetime_column_name
         self.sites_dict = {}
@@ -136,14 +222,14 @@ class TimeSeriesPreprocessor():
 
     def save(self):
         # Check if there's a dir already
-        if not os.path.exists("preprocessed_timeseries/"):
-            os.makedirs("preprocessed_timeseries/")
+        if not os.path.exists(self.load_dir_name):
+            os.makedirs(self.load_dir_name)
 
         # Saving each TimeSeries
         for site in self.sites_dict.keys():
             for variable in self.sites_dict[site]:
                 self.sites_dict[site][variable].pd_dataframe()\
-                    .to_csv(f"preprocessed_timeseries/{site}-{variable}.csv")
+                    .to_csv(f"{self.load_dir_name}{site}-{variable}.csv")
 
     def load(self):
         # Need to check what are the possible variables that there could be in null, 
@@ -152,8 +238,7 @@ class TimeSeriesPreprocessor():
         sites_dict_present = {}
         
         # Need to fill sites_dict and sites_dict_null
-        dir_path = "preprocessed_timeseries/"
-        files = os.listdir(dir_path)
+        files = os.listdir(self.load_dir_name)
         for file in files:
             if file.endswith(".csv"):
                 # Reading in file name; this is bad practice here, I should redo 
@@ -163,7 +248,7 @@ class TimeSeriesPreprocessor():
                 except:
                     site, var1, var2 = file.replace(".csv", "").split("_")
                     variable = var1 + "_" + var2
-                file_path = os.path.join(dir_path, file)
+                file_path = os.path.join(self.load_dir_name, file)
                 df = pd.read_csv(file_path)
     
                 # To make a time series, need to isolate time index and values
