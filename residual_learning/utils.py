@@ -34,25 +34,19 @@ def crps(forecast, ground_truth):
     """
     Returns an array of CRPS scores 
     """
-    crps = []
-    for i, day_forecast_ in enumerate(forecast):
-        # Indexing and transforming forecast and ground truth for each day
-        day_ground_truth = ground_truth[i].median().univariate_values()[0]
-        day_forecast = day_forecast_.all_values()[0][0]
-        n = len(day_forecast)
-        crps_day = 0
-        for sample in day_forecast:
-            crps_lh = 1/n * np.abs(sample - day_ground_truth)
-            crps_rh = sum([-1/(2 * n **2) * np.abs(sample - x) for x in day_forecast])
- 
-            crps_day += crps_lh + crps_rh
+    forecast_array = forecast.pd_dataframe().values
+    observed_array = observed.median().pd_series().values
 
-        crps.append(crps_day)
+    crps_scores = []
+    for i in range(len(forecast_array)):
+        # Note forecastscore is CRPS.CRPS
+        crps, _, __ = forecastscore(forecast_array[i], observed_array[i]).compute()
+        crps_scores.append(crps)
 
-    crps_ts = TimeSeries.from_times_and_values(forecast.time_index, 
-                                               np.array(crps), 
-                                               fill_missing_dates=True, freq="D")
-    return crps_ts
+    crps_scores = TimeSeries.from_times_and_values(forecast.time_index, 
+                                     crps_scores, 
+                                     fill_missing_dates=True, freq="D")
+    return crps_scores
 
 class HistoricalForecaster():
     def __init__(self,
@@ -489,7 +483,7 @@ class BaseForecaster():
             self.sites_dict[site][key].plot(color="blue", label=f"{key} @ {site}")
             plt.show()
     
-@ray.remote
+#@ray.remote
 class ResidualForecasterDarts():
     def __init__(self,
                  historical_forecasts: Optional[TimeSeries] = None,
@@ -529,12 +523,17 @@ class ResidualForecasterDarts():
                        self.historical_ground_truth.end_time(),
                        self.covariates.end_time())
         
-        self.covariates = self.covariates.slice(start_date, end_date)
         self.historical_forecasts = self.historical_forecasts.slice(start_date, end_date)
         self.historical_ground_truth = self.historical_ground_truth.slice(start_date, end_date)
         # Adding the historical forecast and observed data to the covariates
-        for time_series in [self.historical_forecasts, self.historical_ground_truth]:
-            self.covariates = self.covariates.concatenate(time_series, axis=1, ignore_time_axis=True)
+        if self.covariates == Nones:
+            self.covariates = self.historical_forecasts.concatenate(self.historical_ground_truth,
+                                                                    axis=1,
+                                                                    ignore_time_axis=True)
+        else:
+            self.covariates = self.covariates.slice(start_date, end_date)
+            for time_series in [self.historical_forecasts, self.historical_ground_truth]:
+                self.covariates = self.covariates.concatenate(time_series, axis=1, ignore_time_axis=True)
 
         # Getting the date so that we can create the training and test set
         year = int(self.validation_split_date[:4])
@@ -631,4 +630,4 @@ class ResidualForecasterDarts():
         self.predictions = self.scaler.inverse_transform(predictions)
 
         self.predictions.pd_dataframe().to_csv(self.output_csv_name)
-    
+
