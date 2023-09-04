@@ -30,7 +30,7 @@ import numpy as np
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
-def crps(forecast, ground_truth):
+def crps(forecast, observed):
     """
     Returns an array of CRPS scores 
     """
