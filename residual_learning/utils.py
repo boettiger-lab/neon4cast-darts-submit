@@ -23,6 +23,7 @@ from darts.dataprocessing.transformers import Scaler
 from darts.metrics import smape
 from datetime import datetime, timedelta
 import ray
+import CRPS.CRPS as forecastscore
 import os
 import optuna
 import argparse
@@ -86,7 +87,7 @@ class HistoricalForecaster():
         the forecast
         """
         # Using the medians of the GP filter
-        median_df = data_preprocessor.sites_dict[self.site_id]\
+        median_df = self.data_preprocessor.sites_dict[self.site_id]\
                         [self.target_variable].median().pd_dataframe()
         median_df["timestamp"] = pd.to_datetime(median_df.index)
         median_df["day_of_year"] = median_df["timestamp"].dt.dayofyear
