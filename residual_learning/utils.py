@@ -49,6 +49,7 @@ def crps(forecast, observed):
                                      fill_missing_dates=True, freq="D")
     return crps_scores
 
+
 class HistoricalForecaster():
     def __init__(self,
                  data_preprocessor: Optional = None,
@@ -65,6 +66,13 @@ class HistoricalForecaster():
         self.site_id = site_id
         self.target_variable = target_variable
         self._preprocess_data()
+        # Using the medians of the GP filter
+        median_df = self.training_set.median().pd_dataframe()
+        median_df["timestamp"] = pd.to_datetime(median_df.index)
+        median_df["day_of_year"] = median_df["timestamp"].dt.dayofyear
+        
+        # Computing average and std for doy's 
+        self.doy_df = median_df.groupby(['day_of_year'])['0'].agg(['mean', 'std'])
 
     def _preprocess_data(self):
         stitched_series_dict = self.data_preprocessor.sites_dict[self.site_id]
@@ -86,20 +94,11 @@ class HistoricalForecaster():
         This function finds the historical mean and var, and uses these statistics for
         the forecast
         """
-        # Using the medians of the GP filter
-        median_df = self.data_preprocessor.sites_dict[self.site_id]\
-                        [self.target_variable].median().pd_dataframe()
-        median_df["timestamp"] = pd.to_datetime(median_df.index)
-        median_df["day_of_year"] = median_df["timestamp"].dt.dayofyear
-        
-        # Computing average and std for doy's 
-        doy_df = median_df.groupby(['day_of_year'])['0'].agg(['mean', 'std'])
-        
         # Filtering the previously computed averages and std for our dates of interest
         forecast_doys = pd.date_range(start=self.validation_split_date, 
                                       periods=self.forecast_horizon, 
                                       freq='D').dayofyear
-        forecast_df = doy_df.loc[forecast_doys]
+        forecast_df = self.doy_df.loc[forecast_doys]
 
         # Function to give date from the numerical doy
         def day_of_year_to_date(year, day_of_year):
@@ -107,8 +106,8 @@ class HistoricalForecaster():
             target_date = base_date + timedelta(days=day_of_year - 1)
             return target_date
 
-        samples = np.array([np.random.normal(doy_df.loc[doy_df.index == doy]["mean"],
-                                    doy_df.loc[doy_df.index == doy]["std"]/2,
+        samples = np.array([np.random.normal(self.doy_df.loc[self.doy_df.index == doy]["mean"],
+                                    self.doy_df.loc[self.doy_df.index == doy]["std"]/2,
                                     size=(1, 500)) for doy in forecast_df.index])
 
         # Now creating an index going from doy to date
@@ -131,6 +130,20 @@ class HistoricalForecaster():
                          alpha=0.2,)
         fig.autofmt_xdate()
         plt.legend()
+
+    def get_residuals(self):
+        residual_list = []
+        # Going through each date and finding the difference between the doy historical mean and
+        # the observed value
+        for date in self.training_set.time_index:
+            doy = date.dayofyear
+            observed = self.training_set.slice_n_points_after(date, 1).median().values()[0][0]
+            historical_mean = self.doy_df.loc[doy]["mean"]
+            residual = observed - historical_mean
+            residual_list.append(residual)
+
+        self.residuals = TimeSeries.from_times_and_values(self.training_set.time_index, residual_list) 
+        
 
 class TimeSeriesPreprocessor():
     def __init__(self,
