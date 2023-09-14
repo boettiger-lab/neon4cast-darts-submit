@@ -307,6 +307,7 @@ class BaseForecaster():
                  model_likelihood: Optional[dict] = None,
                  forecast_horizon: Optional[int] = 30,
                  site_id: Optional[str] = None,
+                 epochs: Optional[int] = 500,
                  ):
         self.model_ = {"BlockRNN": BlockRNNModel, 
                        "TCN": TCNModel, 
@@ -325,6 +326,7 @@ class BaseForecaster():
         self.validation_split_date = validation_split_date
         self.forecast_horizon = forecast_horizon
         self.site_id = site_id
+        self.epochs = epochs
         if model_hyperparameters == None:
             self.hyperparams = {"input_chunk_length" : 180}
         else:
@@ -388,7 +390,7 @@ class BaseForecaster():
             # Don't need to tune XGB and linear regression models
             extras = {"past_covariates": covariates,
                       "verbose": False,
-                      "epochs": 500}
+                      "epochs": self.epochs}
         
             self.model.fit(training_set,
                            **extras)
@@ -397,13 +399,13 @@ class BaseForecaster():
                                             past_covariates=covariates, 
                                             num_samples=50)
             predictions = self.scaler.inverse_transform(predictions)
-            smapes = smape(self.validation_set[:self.forecast_horizon], 
-                           predictions, 
-                           n_jobs=-1, 
-                           verbose=False)
+
+            crps = crps(predictions, 
+                        self.validation_set[:self.forecast_horizon],
+                       )
             
-            smape_val = np.mean(smapes)
-            return smape_val if smape_val != np.nan else float("inf")
+            crps_mean = crps.mean(axis=0).values()[0][0]
+            return crps_mean if crps_mean != np.nan else float("inf")
 
         study = optuna.create_study(direction="minimize")
         
@@ -426,7 +428,7 @@ class BaseForecaster():
         # Need to treat XGB and Linear Regression models differently than networks
         extras = {"past_covariates": covariates,
                   "verbose": False,
-                  "epochs": 500}
+                  "epochs": self.epochs}
         if self.model_ == XGBModel or self.model_ == LinearRegressionModel:
             del extras["epochs"]
             del extras["verbose"]
