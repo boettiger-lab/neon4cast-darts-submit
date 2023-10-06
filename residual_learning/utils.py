@@ -152,11 +152,17 @@ class TimeSeriesPreprocessor():
                  load_dir_name: Optional[str] = "preprocessed_timeseries/",
                  datetime_column_name: Optional[str] = "datetime",
                  covariates_names: Optional[list] = None,
+                 filter_kw_args: Optional[dict] = {"alpha_0": 0.001,
+                                                   "alpha_1": 2,
+                                                   "n_restarts_0": 100,
+                                                   "n_restarts_1": 10,
+                                                   "num_samples": 500,},
                  ):
         self.input_csv_name = input_csv_name
         self.load_dir_name = load_dir_name
         self.df = pd.read_csv(self.input_csv_name)
         self.datetime_column_name = datetime_column_name
+        self.filter_kw_args = filter_kw_args
         self.sites_dict = {}
         self.sites_dict_null = {}
     
@@ -168,19 +174,20 @@ class TimeSeriesPreprocessor():
         kernel = RBF()
         
         gpf_missing = GaussianProcessFilter(kernel=kernel, 
-                                            alpha=0.001, 
-                                            n_restarts_optimizer=100)
+                        alpha=self.filter_kw_args["alpha_0"], 
+                        n_restarts_optimizer=self.filter_kw_args["n_restarts_0"])
         
         gpf_missing_big_gaps = GaussianProcessFilter(kernel=kernel, 
-                                                     alpha=2, 
-                                                     n_restarts_optimizer=10)
+                        alpha=self.filter_kw_args["alpha_1"], 
+                        n_restarts_optimizer=self.filter_kw_args["n_restarts_1"])
         stitched_series = {}
     
         # Filtering the TimeSeries
         try:
-            filtered = gpf_missing.filter(variable_tseries, num_samples=500)
+            filtered = gpf_missing.filter(variable_tseries, 
+                                          num_samples=self.filter_kw_args["num_samples"])
             filtered_big_gaps = gpf_missing_big_gaps.filter(variable_tseries, 
-                                                            num_samples=500)
+                                          num_samples=self.filter_kw_args["num_samples"])
         except:
             return None
     
@@ -250,8 +257,7 @@ class TimeSeriesPreprocessor():
         files = os.listdir(self.load_dir_name)
         for file in files:
             if file.endswith(".csv"):
-                # Reading in file name; this is bad practice here, I should redo 
-                # naming convention
+                # Reading in file name
                 try:
                     site, variable = file.replace(".csv", "").split("_") # Change this to split at "-"
                 except:
@@ -264,7 +270,7 @@ class TimeSeriesPreprocessor():
                 times = pd.to_datetime(df["datetime"])
                 times = pd.DatetimeIndex(times)
                 values = df.loc[:, df.columns!="datetime"].to_numpy()\
-                        .reshape((-1, 1, 500))
+                        .reshape((-1, 1, self.filter_kw_args["num_samples"]))
                 time_series = TimeSeries.from_times_and_values(times, 
                                                                values, 
                                               fill_missing_dates=True, 
@@ -300,7 +306,7 @@ class BaseForecaster():
                  model: Optional[str] = None,
                  data_preprocessor: Optional = None,
                  target_variable_column_name: Optional[str] = None,
-                 datetime_column_name: Optional[str] = None,
+                 datetime_column_name: Optional[str] = "datetime",
                  covariates_names: Optional[list] = None,
                  output_csv_name: Optional[str] = "residual_forecaster_output.csv",
                  validation_split_date: Optional[str] = None, #YYYY-MM-DD
@@ -309,6 +315,9 @@ class BaseForecaster():
                  forecast_horizon: Optional[int] = 30,
                  site_id: Optional[str] = None,
                  epochs: Optional[int] = 1,
+                 num_samples: Optional[int] = 500,
+                 num_trials: Optional[int] = 50,
+                 seed: Optional[int] = 0,
                  ):
         self.model_ = {"BlockRNN": BlockRNNModel, 
                        "TCN": TCNModel, 
@@ -330,6 +339,9 @@ class BaseForecaster():
         self.forecast_horizon = forecast_horizon
         self.site_id = site_id
         self.epochs = epochs
+        self.num_samples = num_samples
+        self.num_trials = num_trials
+        self.seed = seed
         if model_hyperparameters == None:
             self.hyperparams = {"input_chunk_length" : 180}
         else:
@@ -403,7 +415,7 @@ class BaseForecaster():
             extras = {"verbose": False,
                       "epochs": self.epochs}
             predict_kws = {"n": len(self.validation_set[:self.forecast_horizon]),
-                           "num_samples": 100}
+                           "num_samples": self.num_samples}
             self.scaler = Scaler()
             if self.covariates is not None:
                 training_set, covariates = self.scaler.fit_transform([self.training_set.median(),
@@ -428,7 +440,7 @@ class BaseForecaster():
 
         study = optuna.create_study(direction="minimize")
         
-        study.optimize(objective, n_trials=50) # Note 10 trials pretty meaningless here
+        study.optimize(objective, n_trials=self.num_trials)
         
         self.hyperparams = study.best_trial.params
 
@@ -440,12 +452,12 @@ class BaseForecaster():
         self.model = self.model_(**self.hyperparams,
                                  output_chunk_length=self.forecast_horizon,
                                  **self.model_likelihood,
-                                 random_state=0)
+                                 random_state=self.seed)
         self.scaler = Scaler()
         extras = {"verbose": False,
                   "epochs": self.epochs}
         predict_kws = {"n": self.forecast_horizon,
-                       "num_samples": 500}
+                       "num_samples": self.num_samples}
         if self.covariates is not None:
             training_set, covariates = self.scaler.fit_transform([self.training_set.median(),
                                                                   self.covariates.median()])
@@ -472,7 +484,7 @@ class BaseForecaster():
         """
         # This presumes that the scaler will not have been modified in interim 
         # from calling `make_forecasts`
-        historical_forecast_kws = {"num_samples": 500,
+        historical_forecast_kws = {"num_samples": self.num_samples,
                                    "forecast_horizon": self.forecast_horizon,
                                    "retrain": False,
                                    "last_points_only": False,
@@ -542,12 +554,18 @@ class ResidualForecaster():
                  model_hyperparameters: Optional[dict] = None,
                  forecast_horizon: Optional[int] = 30,
                  epochs: Optional[int]=1,
+                 num_samples: Optional[int] = 500,
+                 num_trials: Optional[int] = 50,
+                 seed: Optional[int] = 0,
                  ):
         self.residuals = residuals
         self.output_csv_name = output_csv_name
         self.validation_split_date = validation_split_date
         self.forecast_horizon = forecast_horizon
         self.epochs = epochs
+        self.num_samples = num_samples
+        self.num_trials = num_trials
+        self.seed = seed
         if model_hyperparameters == None:
             self.hyperparams = {"input_chunk_length": 540,
                                 "lstm_layers": 4,
@@ -608,7 +626,7 @@ class ResidualForecaster():
                           verbose=False)
 
             predictions = tft_model.predict(n=len(self.validation_set[:self.forecast_horizon]),  
-                                            num_samples=50)
+                                            num_samples=self.num_samples)
             predictions = self.scaler.inverse_transform(predictions)
             
             smapes = smape(self.validation_set[:self.forecast_horizon], 
@@ -622,7 +640,7 @@ class ResidualForecaster():
 
         study = optuna.create_study(direction="minimize")
         
-        study.optimize(objective, n_trials=50) # INCREASE NUMBER OF TRIALS LATER ON
+        study.optimize(objective, n_trials=self.num_trials)
         
         # I save the best hyperparameters to the object self.hyperparameter so that these
         # hyperparameters can be easily referend in the future
@@ -638,7 +656,7 @@ class ResidualForecaster():
         tft = TFTModel(**self.hyperparams,
                output_chunk_length=self.forecast_horizon,
                likelihood=QuantileRegression([0.05, 0.1, 0.5, 0.9, 0.95]),
-               random_state=0)
+               random_state=self.seed)
         self.scaler = Scaler()
         training_set = self.scaler.fit_transform(self.training_set)
         tft.fit(training_set,
@@ -646,7 +664,7 @@ class ResidualForecaster():
                 verbose=False)
 
         predictions = tft.predict(n=self.forecast_horizon,
-                                  num_samples=500)
+                                  num_samples=self.num_samples)
         self.predictions = self.scaler.inverse_transform(predictions)
 
         self.predictions.pd_dataframe().to_csv(self.output_csv_name)
