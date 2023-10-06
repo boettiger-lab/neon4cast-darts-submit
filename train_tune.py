@@ -1,4 +1,7 @@
-from darts.utils.likelihood_models import QuantileRegression
+from darts.utils.likelihood_models import (
+                GaussianLikelihood,
+                QuantileRegression
+)
 from residual_learning.utils import (
                 BaseForecaster, 
                 ResidualForecasterDarts,
@@ -11,7 +14,8 @@ import copy
 import json
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-
+# I want to hyperparameters from a yaml in training_hyper...
+# and save best fit hypers into tuned_hyper..
 for dir in ["tuned_hyperparameters/", "forecasts/"]:
     if not os.path.exists(dir):
         os.makedirs(dir)
@@ -24,7 +28,32 @@ parser.add_argument("--site", default="BARC", type=str)
 parser.add_argument("--date", default="2023-02-26", type=str)
 parser.add_argument("--tune", default=False, action="store_true")
 parser.add_argument("--epochs", default=500, type=int)
+parser.add_argument("--nocovs", default=False, action="store_true")
 args = parser.parse_args()
+
+# Load hypers
+with open(f"hyperparameters/train/{args.model}.yaml") as f:
+    hyperparams_dict = yaml.safe_load(f)
+# And dealing with the tricky inputs of likelihoods and lags
+model_likelihood = {"QuantileRegression": 
+                       {"likelihood": QuantileRegression([0.01, 0.05, 0.1, 
+                                                          0.3, 0.5, 0.7, 
+                                                          0.9, 0.95, 0.99])},
+                    "Quantile": {"likelihood": "quantile"},
+                    "Gaussian": GaussianLikelihood(),
+                    "None": None}[hyperparams_dict["model_likelihood"]]
+if "lags" in hyperparams_dict["model_hyperparameters"].keys():
+    end_range = copy.copy(hyperparams_dict["model_hyperparameters"]["lags"])
+    hyperparams_dict["model_hyperparameters"]["lags"] = [-i for i in range(1, end_range)]
+
+    
+# Need to accomodate options for quantile regression vs gaussian vs dropout
+
+# Using data as covariates besides the target series
+covariates_list = ["air_tmp", "chla", "temperature", "oxygen"]
+covariates_list.remove(args.target)
+if args.nocovs:
+    covariates_list = None
 
 data_preprocessor = TimeSeriesPreprocessor(input_csv_name = "targets.csv.gz",
                                            load_dir_name = "preprocessed_timeseries/")
@@ -33,18 +62,14 @@ data_preprocessor.load()
 output_csv = copy.copy(args.model)
 if args.tune:
     output_csv += "_tuned"
-
 forecaster = BaseForecaster(model=args.model,
                     target_variable_column_name=args.target,
                     data_preprocessor=data_preprocessor,
-                    datetime_column_name="datetime",
-                    covariates_names=["air_tmp", "chla", "temperature"],
+                    covariates_names=covariates_list,
                     output_csv_name=f"forecasts/{output_csv}.csv",
                     validation_split_date=args.date,
-                    model_hyperparameters={'input_chunk_length': 180},
-                    model_likelihood={"likelihood": 
-                                      QuantileRegression([0.01, 0.05, 0.1, 0.3, 0.5, 0.7, 0.9, 0.95, 0.99])},
-                    forecast_horizon=30,
+                    model_hyperparameters=hyperparams_dict["model_hyperparameters"],
+                    model_likelihood=model_likelihood,
                     site_id=args.site,
                     epochs=args.epochs,)
 

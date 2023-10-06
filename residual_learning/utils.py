@@ -537,12 +537,6 @@ class BaseForecaster():
    #        df_dict["covariates"] = 
    #    for variable, df in df_dict.items():
    #        df.to_csv(f"{self.model}_test/{variable}")
-
-    def plot_by_site(self, site):
-        for key in self.sites_dict[site].keys():
-            plt.clf()
-            self.sites_dict[site][key].plot(color="blue", label=f"{key} @ {site}")
-            plt.show()
     
 #@ray.remote
 class ResidualForecaster():
