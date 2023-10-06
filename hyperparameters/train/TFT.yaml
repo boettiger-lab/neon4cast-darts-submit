@@ -1,8 +1,8 @@
 model_hyperparameters:
   input_chunk_length: 31
-  add_encoders: 
+  add_encoders:                        # Only handles future covariates
       datetime_attribute: 
           future: 
               - dayofyear
 
-model_likelihood: 'Quantile'
+model_likelihood: 'QuantileRegression' # Does not accept Quantile

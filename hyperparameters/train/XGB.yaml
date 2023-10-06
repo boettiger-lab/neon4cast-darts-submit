@@ -1,4 +1,4 @@
 model_hyperparameters:
-  lags: 2
+  lags: 2                              # Must use lags which will be same for covariates
 
-model_likelihood: 'Quantile'
+model_likelihood: 'Quantile'           # Only accepts Quantile

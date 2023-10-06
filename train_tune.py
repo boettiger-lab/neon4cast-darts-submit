@@ -4,7 +4,7 @@ from darts.utils.likelihood_models import (
 )
 from residual_learning.utils import (
                 BaseForecaster, 
-                ResidualForecasterDarts,
+                ResidualForecaster,
                 TimeSeriesPreprocessor,
 )
 import argparse
@@ -12,6 +12,8 @@ import time
 import os
 import copy
 import json
+import yaml
+start = time.time()
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 # I want to hyperparameters from a yaml in training_hyper...
@@ -20,7 +22,6 @@ for dir in ["tuned_hyperparameters/", "forecasts/"]:
     if not os.path.exists(dir):
         os.makedirs(dir)
 
-start = time.time()
 parser = argparse.ArgumentParser()
 parser.add_argument("--model", default="BlockRNN", type=str)
 parser.add_argument("--target", default="oxygen", type=str)
@@ -45,6 +46,9 @@ model_likelihood = {"QuantileRegression":
 if "lags" in hyperparams_dict["model_hyperparameters"].keys():
     end_range = copy.copy(hyperparams_dict["model_hyperparameters"]["lags"])
     hyperparams_dict["model_hyperparameters"]["lags"] = [-i for i in range(1, end_range)]
+    if not args.nocovs:
+        hyperparams_dict["model_hyperparameters"]\
+         ["lags_past_covariates"] = [-i for i in range(1, end_range)]
 
     
 # Need to accomodate options for quantile regression vs gaussian vs dropout
@@ -59,20 +63,26 @@ data_preprocessor = TimeSeriesPreprocessor(input_csv_name = "targets.csv.gz",
                                            load_dir_name = "preprocessed_timeseries/")
 data_preprocessor.load()
 
-output_csv = copy.copy(args.model)
+# Handling csv names and directories for the final forecast
+if not os.path.exists(f"forecasts/{args.site}/{args.target}/"):
+    os.makedirs(f"forecasts/{args.site}/{args.target}/")
+output_csv_name = f"forecasts/{args.site}/{args.target}/{args.model}"
 if args.tune:
-    output_csv += "_tuned"
+    output_csv_name += "_tuned"
+
+# Instantiating the model
 forecaster = BaseForecaster(model=args.model,
                     target_variable_column_name=args.target,
                     data_preprocessor=data_preprocessor,
                     covariates_names=covariates_list,
-                    output_csv_name=f"forecasts/{output_csv}.csv",
+                    output_csv_name=f"{output_csv_name}.csv",
                     validation_split_date=args.date,
                     model_hyperparameters=hyperparams_dict["model_hyperparameters"],
                     model_likelihood=model_likelihood,
                     site_id=args.site,
                     epochs=args.epochs,)
 
+# Handling tuning. Hmm, might be better to tuck this away, potentially in yaml
 if args.tune:
     if args.model == "BlockRNN":
         forecaster.tune({
@@ -173,13 +183,7 @@ if args.tune:
 # Read and write to script to keep track of hyperparameters
 forecaster.make_forecasts()
 
+# Need to do work here on putting tuned hyperparameters in a yaml
 
-
-# Dump hyperparameters and relevant info to a json
-with open(f"{dir}{args.model}.json", "w") as json_file:
-    json.dump(forecaster.hyperparams, json_file)
-    json.dump({"site": args.site,
-               "target_variable": args.target,
-               "split_date": args.date}, json_file)
 
 print(f"Runtime: {time.time() - start:.0f} seconds")
