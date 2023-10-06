@@ -17,6 +17,7 @@ from darts.models import (
                           NBEATSModel,
                           XGBModel,
                           LinearRegressionModel,
+                          TFTModel,
                          )
 from darts.utils.likelihood_models import QuantileRegression
 from darts.dataprocessing.transformers import Scaler
@@ -307,7 +308,7 @@ class BaseForecaster():
                  model_likelihood: Optional[dict] = None,
                  forecast_horizon: Optional[int] = 30,
                  site_id: Optional[str] = None,
-                 epochs: Optional[int] = 500,
+                 epochs: Optional[int] = 1,
                  ):
         self.model_ = {"BlockRNN": BlockRNNModel, 
                        "TCN": TCNModel, 
@@ -317,11 +318,13 @@ class BaseForecaster():
                        "DLinear": DLinearModel,
                        "XGB": XGBModel,
                        "NBEATS": NBEATSModel,
-                       "Linear": LinearRegressionModel,}[model]
+                       "Linear": LinearRegressionModel,
+                       "TFT": TFTModel}[model]
         self.data_preprocessor = data_preprocessor
         self.target_variable_column_name = target_variable_column_name
         self.datetime_column_name = datetime_column_name
         self.covariates_names = covariates_names
+        self.covariates = None
         self.output_csv_name = output_csv_name
         self.validation_split_date = validation_split_date
         self.forecast_horizon = forecast_horizon
@@ -348,24 +351,27 @@ class BaseForecaster():
             return "Cannot fit this target time series as no GP fit was performed."
         self.inputs = stitched_series_dict[self.target_variable_column_name]
 
-        # And not using the covariates that did not yield GP fits beforehand
-        for null_variable in self.data_preprocessor.sites_dict_null[self.site_id]:
-            self.covariates_names.remove(null_variable)
+        if self.covariates_names is not None:
+            # And not using the covariates that did not yield GP fits beforehand
+            for null_variable in self.data_preprocessor.sites_dict_null[self.site_id]:
+                self.covariates_names.remove(null_variable)
+    
+            # Initializing covariates list then concatenating in for loop
+            self.covariates = stitched_series_dict[self.covariates_names[0]]
+            for cov_var in self.covariates_names[1:]:
+                self.covariates = self.covariates.concatenate(stitched_series_dict[cov_var], 
+                                                              axis=1, 
+                                                              ignore_time_axis=True)
+            self.covariates = self.covariates.median()
             
-        # Initializing covariates list then concatenating in for loop
-        self.covariates = stitched_series_dict[self.covariates_names[0]]
-        for cov_var in self.covariates_names[1:]:
-            self.covariates = self.covariates.concatenate(stitched_series_dict[cov_var], 
-                                                          axis=1, 
-                                                          ignore_time_axis=True)
+
         # Splitting training and validation set
         year = int(self.validation_split_date[:4])
         month = int(self.validation_split_date[5:7])
         day = int(self.validation_split_date[8:])
         split_date = pd.Timestamp(year=year, month=month, day=day)
-        self.training_set, self.validation_set = self.inputs.split_before(split_date)
-
-
+        # Taking the median now to accomodate using doy covariates
+        self.training_set, self.validation_set = self.inputs.median().split_before(split_date)
 
     def tune(self,
              hyperparameter_dict: Optional[dict]
@@ -379,32 +385,45 @@ class BaseForecaster():
             callback = [PyTorchLightningPruningCallback(trial, monitor="val_loss")]
             hyperparams = {key: trial.suggest_categorical(key, value) 
                                                for key, value in hyperparameter_dict.items()}
+
+            # Need a work around for Encoders need to map "past", "future", "past_and_future"
+            if "add_encoders" in hyperparams.keys():
+                if hyperparams["add_encoders"] == "past":
+                    hyperparams["add_encoders"] = {'datetime_attribute': {'past': ['dayofyear']}}
+                elif hyperparams["add_encoders"] == "future":
+                    hyperparams["add_encoders"] = {'datetime_attribute': {'future': ['dayofyear']}}
+                elif hyperparams["add_encoders"] == "past_and_future":
+                    hyperparams["add_encoders"] = {'datetime_attribute': {'past': ['dayofyear'], 
+                                                                       'future': ['dayofyear']}}
         
             model = self.model_(**hyperparams,
                                 output_chunk_length=self.forecast_horizon,
                                 **self.model_likelihood)
-            
-            self.scaler = Scaler()
-            training_set, covariates = self.scaler.fit_transform([self.training_set,
-                                                                  self.covariates])
-            # Don't need to tune XGB and linear regression models
-            extras = {"past_covariates": covariates,
-                      "verbose": False,
+
+            extras = {"verbose": False,
                       "epochs": self.epochs}
+            predict_kws = {"n": len(self.validation_set[:self.forecast_horizon]),
+                           "num_samples": 100}
+            self.scaler = Scaler()
+            if self.covariates is not None:
+                training_set, covariates = self.scaler.fit_transform([self.training_set.median(),
+                                                                      self.covariates.median()])
+                extras["past_covariates"] = covariates
+                predict_kws["past_covariates": covariates]
+            else:
+                training_set = self.scaler.fit_transform([self.training_set.median()])
+                
         
-            self.model.fit(training_set,
-                           **extras)
-        
-            predictions = model.predict(n=len(self.validation_set[:self.forecast_horizon]), 
-                                            past_covariates=covariates, 
-                                            num_samples=50)
+            model.fit(training_set, **extras)
+            
+            predictions = model.predict(**predict_kws)
             predictions = self.scaler.inverse_transform(predictions)
 
-            crps = crps(predictions, 
+            crps_ = crps(predictions, 
                         self.validation_set[:self.forecast_horizon],
-                       )
+                        )
             
-            crps_mean = crps.mean(axis=0).values()[0][0]
+            crps_mean = crps_.mean(axis=0).values()[0][0]
             return crps_mean if crps_mean != np.nan else float("inf")
 
         study = optuna.create_study(direction="minimize")
@@ -423,12 +442,18 @@ class BaseForecaster():
                                  **self.model_likelihood,
                                  random_state=0)
         self.scaler = Scaler()
-        training_set, covariates = self.scaler.fit_transform([self.training_set,
-                                                              self.covariates])
-        # Need to treat XGB and Linear Regression models differently than networks
-        extras = {"past_covariates": covariates,
-                  "verbose": False,
+        extras = {"verbose": False,
                   "epochs": self.epochs}
+        predict_kws = {"n": self.forecast_horizon,
+                       "num_samples": 500}
+        if self.covariates is not None:
+            training_set, covariates = self.scaler.fit_transform([self.training_set.median(),
+                                                                  self.covariates.median()])
+            extras["past_covariates"] = covariates
+            predict_kws["past_covariates"] = covariates
+        else:
+            training_set = self.scaler.fit_transform([self.training_set.median()])
+        
         if self.model_ == XGBModel or self.model_ == LinearRegressionModel:
             del extras["epochs"]
             del extras["verbose"]
@@ -436,9 +461,7 @@ class BaseForecaster():
         self.model.fit(training_set,
                        **extras)
 
-        predictions = self.model.predict(n=self.forecast_horizon,
-                                         past_covariates=covariates, 
-                                         num_samples=500)
+        predictions = self.model.predict(**predict_kws)
         predictions = self.scaler.inverse_transform(predictions)
 
         predictions.pd_dataframe().to_csv(self.output_csv_name)
@@ -449,17 +472,23 @@ class BaseForecaster():
         """
         # This presumes that the scaler will not have been modified in interim 
         # from calling `make_forecasts`
-        training_set, covariates = self.scaler.transform([self.training_set,
+        historical_forecast_kws = {"num_samples": 500,
+                                   "forecast_horizon": self.forecast_horizon,
+                                   "retrain": False,
+                                   "last_points_only": False,
+                                  }
+        if self.covariates is not None:
+            training_set, covariates = self.scaler.transform([self.training_set,
                                                               self.covariates])
+            historical_forecast_kws["past_covariates"] = covariates
+        else:
+            training_set = self.scaler.transform([self.training_set])
+        historical_forecast_kws["series": training_set]
+        
+        covariates, _ = covariates.split_after(training_set.time_index[-1])
         historical_forecasts = self.model.historical_forecasts(
-                                            series=training_set,
-                                            past_covariates=covariates,
-                                            num_samples=500,
-                                            forecast_horizon=self.forecast_horizon,
-                                            stride=self.forecast_horizon,
-                                            retrain=False,
-                                            last_points_only=False
-                                            )
+                                                    **historical_forecast_kws
+                                                              )
         historical_forecasts = [self.scaler.inverse_transform(historical_forecast) for
                                                 historical_forecast in historical_forecasts]
         # Getting the target time series slice for the historical forecast
@@ -475,23 +504,27 @@ class BaseForecaster():
                                                                 axis=0, 
                                                                 ignore_time_axis=True)
 
-        self.residuals = self.historical_ground_truth - self.historical_forecasts
 
-    def make_residuals_csv(self):
-        covariates_df = self.covariates.pd_dataframe()
-        forecast_df = self.historical_forecasts.pd_dataframe()
-        observed_df = self.historical_ground_truth.pd_dataframe()
-        residuals_df = self.residuals.pd_dataframe()
-
-        # Creating a folder if it doesn't exist already
-        if not os.path.exists(f"{self.model}_residuals/"):
-            os.makedirs(f"{self.model}_residuals/")
-        # Saving csv's in the **model name**_test directory
-        df_dict = {"covariates": block_rnn_forecaster.covariates.pd_dataframe(),
-                   "forecast": block_rnn_forecaster.historical_forecasts.pd_dataframe(),
-                   "observed": block_rnn_forecaster.historical_ground_truth.pd_dataframe()}
-        for variable, df in df_dict.items():
-            df.to_csv(f"{self.model}_test/{variable}")
+        self.residuals = self.historical_ground_truth - self.historical_forecasts.median()
+# This needs to be reviewed, not sure what I was doing here
+   #def make_residuals_csv(self):
+   #    
+   #    forecast_df = self.historical_forecasts.pd_dataframe()
+   #    observed_df = self.historical_ground_truth.pd_dataframe()
+   #    residuals_df = self.residuals.pd_dataframe()
+#
+   #    # Creating a folder if it doesn't exist already
+   #    if not os.path.exists(f"{self.model}_residuals/"):
+   #        os.makedirs(f"{self.model}_residuals/")
+   #    # Saving csv's in the **model name**_test directory
+   #    df_dict = {"covariates": cov,
+   #               "forecast": forecast_df,
+   #               "observed": self.historical_ground_truth.pd_dataframe()}
+   #    if self.covariates is not None:
+   #        covariates_df = self.covariates.pd_dataframe()
+   #        df_dict["covariates"] = 
+   #    for variable, df in df_dict.items():
+   #        df.to_csv(f"{self.model}_test/{variable}")
 
     def plot_by_site(self, site):
         for key in self.sites_dict[site].keys():
@@ -500,27 +533,26 @@ class BaseForecaster():
             plt.show()
     
 #@ray.remote
-class ResidualForecasterDarts():
+class ResidualForecaster():
     def __init__(self,
-                 historical_forecasts: Optional[TimeSeries] = None,
-                 historical_ground_truth: Optional[TimeSeries] = None,
-                 covariates: Optional[TimeSeries] = None,
+                 residuals: Optional[TimeSeries] = None,
                  output_csv_name: Optional[str] = "residual_forecaster_output.csv",
                  validation_split_date: Optional[str] = None, #YYYY-MM-DD
                  tune_model: Optional[bool] = False,
                  model_hyperparameters: Optional[dict] = None,
-                 forecast_horizon: Optional[int] = 30
+                 forecast_horizon: Optional[int] = 30,
+                 epochs: Optional[int]=1,
                  ):
-
-        self.historical_forecasts = historical_forecasts
-        self.historical_ground_truth = historical_ground_truth
-        self.residuals = self.historical_ground_truth - self.historical_forecasts
-        self.covariates = covariates
+        self.residuals = residuals
         self.output_csv_name = output_csv_name
         self.validation_split_date = validation_split_date
         self.forecast_horizon = forecast_horizon
+        self.epochs = epochs
         if model_hyperparameters == None:
-            self.hyperparams = {"input_chunk_length": 180}
+            self.hyperparams = {"input_chunk_length": 540,
+                                "lstm_layers": 4,
+                                "add_encoders": {'datetime_attribute': {'future': ['dayofyear']}}
+                                }
         else:
             self.hyperparams = model_hyperparameters
         self._preprocess_data()
@@ -530,43 +562,21 @@ class ResidualForecasterDarts():
         """
         Divides input time series into training and validation sets
         """
-        # When Concatenating time series, they have to be the same lengths
-        # so here I get the slice dates that will work across the different time series
-        start_date = max(self.historical_forecasts.time_index[0],
-                         self.historical_ground_truth.time_index[0],
-                         self.covariates.time_index[0])
-        end_date = min(self.historical_forecasts.end_time(),
-                       self.historical_ground_truth.end_time(),
-                       self.covariates.end_time())
-        
-        self.historical_forecasts = self.historical_forecasts.slice(start_date, end_date)
-        self.historical_ground_truth = self.historical_ground_truth.slice(start_date, end_date)
-        # Adding the historical forecast and observed data to the covariates
-        if self.covariates == Nones:
-            self.covariates = self.historical_forecasts.concatenate(self.historical_ground_truth,
-                                                                    axis=1,
-                                                                    ignore_time_axis=True)
-        else:
-            self.covariates = self.covariates.slice(start_date, end_date)
-            for time_series in [self.historical_forecasts, self.historical_ground_truth]:
-                self.covariates = self.covariates.concatenate(time_series, axis=1, ignore_time_axis=True)
-
         # Getting the date so that we can create the training and test set
         year = int(self.validation_split_date[:4])
         month = int(self.validation_split_date[5:7])
         day = int(self.validation_split_date[8:])
         split_date = pd.Timestamp(year=year, month=month, day=day)
-        self.residuals = self.residuals.slice(start_date, end_date)
         self.training_set, self.validation_set = self.residuals.split_before(split_date)
 
     
     def tune(self,
              input_chunk_length: Optional[list] = [31, 60, 180, 356],
-             kernel_size: Optional[list] = [2, 3, 5],
-             num_filters: Optional[list] = [1, 3, 5],
-             num_layers: Optional[list] = [None, 1, 2, 3],
-             dilation_base: Optional[list] = [1, 2, 3],
-             dropout: Optional[list] = [0.1, 0.2, 0.3]):
+             hidden_size: Optional[list] = [2, 3, 5],
+             num_attention_heads: Optional[list] = [2, 4, 8, 16],
+             lstm_layers: Optional[list] = [1, 2, 3],
+             dropout: Optional[list] = [0, 0.1, 0.2, 0.3],
+             ):
         """
         Sets up Optuna trial to perform hyperparameter tuning
         """
@@ -577,30 +587,27 @@ class ResidualForecasterDarts():
             # Selecting the hyperparameters
             input_chunk_length_ = trial.suggest_categorical("input_chunk_length", 
                                                                input_chunk_length)
-            kernel_size_ = trial.suggest_categorical("kernel_size", kernel_size)
-            num_filters_ = trial.suggest_categorical("num_filters", num_filters)
-            num_layers_ = trial.suggest_categorical("num_layers", num_layers)
-            dilation_base_ = trial.suggest_categorical("dilation_base", dilation_base)
+            hidden_size_ = trial.suggest_categorical("hidden_size", hidden_size)
+            num_attention_heads_ = trial.suggest_categorical("num_attention_heads", num_attention_heads)
+            lstm_layers_ = trial.suggest_categorical("lstm_layers", lstm_layers)
             dropout_ = trial.suggest_categorical("dropout", dropout)
 
-            tcn_model = TCNModel(input_chunk_length=input_chunk_length_,
-                            kernel_size=kernel_size_,
-                            num_filters=num_filters_,
-                            dilation_base=dilation_base_,
+            tft_model = TFTModel(input_chunk_length=input_chunk_length_,
+                            hidden_size=hidden_size_,
+                            num_attention_heads=num_attention_heads_,
+                            lstm_layers=lstm_layers_,
                             output_chunk_length=self.forecast_horizon,
-                            likelihood=QuantileRegression([0.05, 0.1, 0.5, 0.9, 0.95]))
+                            likelihood=QuantileRegression([0.05, 0.1, 0.5, 0.9, 0.95]),
+                            add_encoders={'datetime_attribute': {'future': ['dayofyear']}})
 
             # Normalizing data to 0, 1 scale and fitting the model
             self.scaler = Scaler()
-            training_set, covariates = self.scaler.fit_transform([self.training_set,
-                                                                  self.covariates])
-            tcn_model.fit(training_set,
-                          past_covariates=covariates,
-                          epochs=400, 
+            training_set = self.scaler.fit_transform(self.training_set)
+            tft_model.fit(training_set,
+                          epochs=self.epochs, 
                           verbose=False)
 
-            predictions = tcn_model.predict(n=len(self.validation_set[:self.forecast_horizon]), 
-                                            past_covariates=covariates, 
+            predictions = tft_model.predict(n=len(self.validation_set[:self.forecast_horizon]),  
                                             num_samples=50)
             predictions = self.scaler.inverse_transform(predictions)
             
@@ -628,20 +635,17 @@ class ResidualForecasterDarts():
         # For clarity, I print the hyperparameters. Otherwise, following the standard
         # model fitting steps in Darts
         print(self.hyperparams)
-        tcn = TCNModel(**self.hyperparams,
+        tft = TFTModel(**self.hyperparams,
                output_chunk_length=self.forecast_horizon,
                likelihood=QuantileRegression([0.05, 0.1, 0.5, 0.9, 0.95]),
                random_state=0)
         self.scaler = Scaler()
-        training_set, covariates = self.scaler.fit_transform([self.training_set,
-                                                              self.covariates])
-        tcn.fit(training_set,
-                past_covariates=covariates,
-                epochs=500, 
+        training_set = self.scaler.fit_transform(self.training_set)
+        tft.fit(training_set,
+                epochs=self.epochs, 
                 verbose=False)
 
-        predictions = tcn.predict(n=self.forecast_horizon,
-                                  past_covariates=covariates, 
+        predictions = tft.predict(n=self.forecast_horizon,
                                   num_samples=500)
         self.predictions = self.scaler.inverse_transform(predictions)
 
