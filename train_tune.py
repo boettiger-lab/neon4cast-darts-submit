@@ -29,11 +29,16 @@ parser.add_argument("--site", default="BARC", type=str)
 parser.add_argument("--date", default="2023-02-26", type=str)
 parser.add_argument("--tune", default=False, action="store_true")
 parser.add_argument("--epochs", default=500, type=int)
+parser.add_argument("--num_trials", default=1, type=int)
 parser.add_argument("--nocovs", default=False, action="store_true")
+parser.add_argument("--test_tuned", default=False, action="store_true")
 args = parser.parse_args()
 
 # Load hypers
-with open(f"hyperparameters/train/{args.model}.yaml") as f:
+hyperparams_loc = f"hyperparameters/train/{args.model}"
+if args.test_tuned:
+    hyperparams_loc = f"hyperparameters/tuned/{args.model}"
+with open(f"{hyperparams_loc}.yaml") as f:
     hyperparams_dict = yaml.safe_load(f)
 # And dealing with the tricky inputs of likelihoods and lags
 model_likelihood = {"QuantileRegression": 
@@ -46,6 +51,7 @@ model_likelihood = {"QuantileRegression":
 if "lags" in hyperparams_dict["model_hyperparameters"].keys():
     end_range = copy.copy(hyperparams_dict["model_hyperparameters"]["lags"])
     hyperparams_dict["model_hyperparameters"]["lags"] = [-i for i in range(1, end_range)]
+    # I'm foressing that there is going to be an issue here with lags
     if not args.nocovs:
         hyperparams_dict["model_hyperparameters"]\
          ["lags_past_covariates"] = [-i for i in range(1, end_range)]
@@ -80,7 +86,8 @@ forecaster = BaseForecaster(model=args.model,
                     model_hyperparameters=hyperparams_dict["model_hyperparameters"],
                     model_likelihood=model_likelihood,
                     site_id=args.site,
-                    epochs=args.epochs,)
+                    epochs=args.epochs,
+                    num_trials=args.num_trials,)
 
 # Handling tuning. Hmm, might be better to tuck this away, potentially in yaml
 if args.tune:
@@ -141,11 +148,7 @@ if args.tune:
                                       [-i for i in range(1, 180)],
                                       [-i for i in range(1, 360)],
                                       [-i for i in range(1, 540)]],
-            "lags_future_covariates" : [[-i for i in range(1, 60)],
-                                        [-i for i in range(1, 180)],
-                                        [-i for i in range(1, 360)],
-                                        [-i for i in range(1, 540)]],
-            "add_encoders": ["past_and_future"],
+            "add_encoders": ["past"],
         })
     elif args.model == "NBeats":
         forecaster.tune({
@@ -165,11 +168,7 @@ if args.tune:
                                       [-i for i in range(1, 180)],
                                       [-i for i in range(1, 360)],
                                       [-i for i in range(1, 540)]],
-            "lags_future_covariates" : [[-i for i in range(1, 60)],
-                                        [-i for i in range(1, 180)],
-                                        [-i for i in range(1, 360)],
-                                        [-i for i in range(1, 540)]],
-            "add_encoders": ["past_and_future"],
+            "add_encoders": ["past"],
         })
     elif args.model == "TFT":
         forecaster.tune({
@@ -184,6 +183,12 @@ if args.tune:
 forecaster.make_forecasts()
 
 # Need to do work here on putting tuned hyperparameters in a yaml
+if args.tune:
+    with open(f"hyperparameters/tuned/{args.model}.yaml", 'w') as file:
+        tuned_hyperparams = {"model_hyperparameters": forecaster.hyperparams, 
+                             "model_likelihood": hyperparams_dict["model_likelihood"]}
+        yaml.dump(tuned_hyperparams, file, default_flow_style=False)
+        # You also need to deal with lags
 
 
 print(f"Runtime: {time.time() - start:.0f} seconds")
