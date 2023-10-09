@@ -1,4 +1,0 @@
-model_hyperparameters:
-  lags: 2
-
-model_likelihood: 'Quantile'

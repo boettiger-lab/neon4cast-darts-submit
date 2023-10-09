@@ -1,7 +1,0 @@
-model_hyperparameters:
-  add_encoders: past_and_future
-  full_attention: true
-  hidden_size: 64
-  input_chunk_length: 540
-  lstm_layers: 2
-model_likelihood: QuantileRegression

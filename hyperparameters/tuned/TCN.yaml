@@ -1,7 +1,0 @@
-model_hyperparameters:
-  add_encoders: past
-  input_chunk_length: 180
-  kernel_size: 5
-  lr: 0.0001
-  num_filters: 5
-model_likelihood: QuantileRegression
