@@ -1,0 +1,5 @@
+model_hyperparameters:
+  add_encoders: past
+  lags: 180
+  lags_past_covariates: 540
+model_likelihood: Quantile

@@ -1,0 +1,8 @@
+model_hyperparameters:
+  add_encoders: past
+  hidden_dim: 64
+  input_chunk_length: 540
+  lr: 0.001
+  model: RNN
+  n_rnn_layers: 4
+model_likelihood: QuantileRegression

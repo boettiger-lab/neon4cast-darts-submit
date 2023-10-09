@@ -28,6 +28,7 @@ import CRPS.CRPS as forecastscore
 import os
 import optuna
 import argparse
+import copy
 import numpy as np
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
@@ -318,6 +319,7 @@ class BaseForecaster():
                  num_samples: Optional[int] = 500,
                  num_trials: Optional[int] = 50,
                  seed: Optional[int] = 0,
+                 verbose: Optional[bool] = False,
                  ):
         self.model_ = {"BlockRNN": BlockRNNModel, 
                        "TCN": TCNModel, 
@@ -342,6 +344,8 @@ class BaseForecaster():
         self.num_samples = num_samples
         self.num_trials = num_trials
         self.seed = seed
+        self.tuned = False
+        self.verbose = verbose
         if model_hyperparameters == None:
             self.hyperparams = {"input_chunk_length" : 180}
         else:
@@ -398,16 +402,9 @@ class BaseForecaster():
             hyperparams = {key: trial.suggest_categorical(key, value) 
                                                for key, value in hyperparameter_dict.items()}
 
-            # Need a work around for Encoders need to map "past", "future", "past_and_future"
-            if "add_encoders" in hyperparams.keys():
-                if hyperparams["add_encoders"] == "past":
-                    hyperparams["add_encoders"] = {'datetime_attribute': {'past': ['dayofyear']}}
-                elif hyperparams["add_encoders"] == "future":
-                    hyperparams["add_encoders"] = {'datetime_attribute': {'future': ['dayofyear']}}
-                elif hyperparams["add_encoders"] == "past_and_future":
-                    hyperparams["add_encoders"] = {'datetime_attribute': {'past': ['dayofyear'], 
-                                                                       'future': ['dayofyear']}}
-        
+            # Need to handle lags and time axis encoders
+            hyperparams = self.prepare_hyperparams(hyperparams)
+
             model = self.model_(**hyperparams,
                                 output_chunk_length=self.forecast_horizon,
                                 **self.model_likelihood)
@@ -417,14 +414,19 @@ class BaseForecaster():
             predict_kws = {"n": len(self.validation_set[:self.forecast_horizon]),
                            "num_samples": self.num_samples}
             self.scaler = Scaler()
+            # Need to treat transformation differently if models use covariates or not
             if self.covariates is not None:
                 training_set, covariates = self.scaler.fit_transform([self.training_set.median(),
                                                                       self.covariates.median()])
                 extras["past_covariates"] = covariates
-                predict_kws["past_covariates": covariates]
+                predict_kws["past_covariates"] = covariates
             else:
                 training_set = self.scaler.fit_transform([self.training_set.median()])
-                
+
+            # Need to delete epochs which aren't used in the regression models
+            if self.model_ == XGBModel or self.model_ == LinearRegressionModel:
+                del extras["epochs"]
+                del extras["verbose"]
         
             model.fit(training_set, **extras)
             
@@ -443,18 +445,22 @@ class BaseForecaster():
         study.optimize(objective, n_trials=self.num_trials)
         
         self.hyperparams = study.best_trial.params
+        self.tuned = True
 
     def make_forecasts(self):
         """
         This function fits a Darts model to the training_set
         """
         print(self.hyperparams)
+        # Need to handle lags and time axis encoders
+        self.hyperparams = self.prepare_hyperparams(self.hyperparams)
+        
         self.model = self.model_(**self.hyperparams,
                                  output_chunk_length=self.forecast_horizon,
                                  **self.model_likelihood,
                                  random_state=self.seed)
         self.scaler = Scaler()
-        extras = {"verbose": False,
+        extras = {"verbose": self.verbose,
                   "epochs": self.epochs}
         predict_kws = {"n": self.forecast_horizon,
                        "num_samples": self.num_samples}
@@ -469,7 +475,7 @@ class BaseForecaster():
         if self.model_ == XGBModel or self.model_ == LinearRegressionModel:
             del extras["epochs"]
             del extras["verbose"]
-    
+
         self.model.fit(training_set,
                        **extras)
 
@@ -518,6 +524,22 @@ class BaseForecaster():
 
 
         self.residuals = self.historical_ground_truth - self.historical_forecasts.median()
+
+    def prepare_hyperparams(self, hyperparams_dict):
+        if "add_encoders" in hyperparams_dict.keys():
+            if hyperparams_dict["add_encoders"] == "past":
+                hyperparams_dict["add_encoders"] = {'datetime_attribute': {'past': ['dayofyear']}}
+            elif hyperparams_dict["add_encoders"] == "future":
+                hyperparams_dict["add_encoders"] = {'datetime_attribute': {'future': ['dayofyear']}}
+            elif hyperparams_dict["add_encoders"] == "past_and_future":
+                hyperparams_dict["add_encoders"] = {'datetime_attribute': {'past': ['dayofyear'], 
+                                                                   'future': ['dayofyear']}}
+        if "lr" in hyperparams_dict.keys():
+            hyperparams_dict["optimizer_kwargs"] = {"lr": hyperparams_dict["lr"]}
+            del hyperparams_dict["lr"]
+
+        return hyperparams_dict
+        
 # This needs to be reviewed, not sure what I was doing here
    #def make_residuals_csv(self):
    #    

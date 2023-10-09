@@ -1,0 +1,7 @@
+model_hyperparameters:
+  add_encoders: past
+  input_chunk_length: 540
+  nhead: 8
+  num_decoder_layers: 2
+  num_encoder_layers: 2
+model_likelihood: QuantileRegression

@@ -1,0 +1,7 @@
+model_hyperparameters:
+  add_encoders: future
+  hidden_dim: 32
+  input_chunk_length: 60
+  model: LSTM
+  n_rnn_layers: 4
+model_likelihood: QuantileRegression

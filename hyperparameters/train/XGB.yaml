@@ -1,7 +1,5 @@
 model_hyperparameters:
   lags: 2                              # Must use lags
-  add_encoders:                        # Always use past encoders
-    datetime_attribute:
-      past:
-      - dayofyear
+  lags_past_covariates: 2
+  add_encoders: past                   # Always use past encoders
 model_likelihood: 'Quantile'           # Only accepts Quantile

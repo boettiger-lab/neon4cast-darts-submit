@@ -32,6 +32,7 @@ parser.add_argument("--epochs", default=500, type=int)
 parser.add_argument("--num_trials", default=1, type=int)
 parser.add_argument("--nocovs", default=False, action="store_true")
 parser.add_argument("--test_tuned", default=False, action="store_true")
+parser.add_argument("--verbose", default=False, action="store_true")
 args = parser.parse_args()
 
 # Load hypers
@@ -48,14 +49,6 @@ model_likelihood = {"QuantileRegression":
                     "Quantile": {"likelihood": "quantile"},
                     "Gaussian": GaussianLikelihood(),
                     "None": None}[hyperparams_dict["model_likelihood"]]
-if "lags" in hyperparams_dict["model_hyperparameters"].keys():
-    end_range = copy.copy(hyperparams_dict["model_hyperparameters"]["lags"])
-    hyperparams_dict["model_hyperparameters"]["lags"] = [-i for i in range(1, end_range)]
-    # I'm foressing that there is going to be an issue here with lags
-    if not args.nocovs:
-        hyperparams_dict["model_hyperparameters"]\
-         ["lags_past_covariates"] = [-i for i in range(1, end_range)]
-
     
 # Need to accomodate options for quantile regression vs gaussian vs dropout
 
@@ -77,6 +70,9 @@ if args.tune:
     output_csv_name += "_tuned"
 
 # Instantiating the model
+extras = {"epochs": args.epochs,
+          "verbose": args.verbose,}
+    
 forecaster = BaseForecaster(model=args.model,
                     target_variable_column_name=args.target,
                     data_preprocessor=data_preprocessor,
@@ -86,10 +82,11 @@ forecaster = BaseForecaster(model=args.model,
                     model_hyperparameters=hyperparams_dict["model_hyperparameters"],
                     model_likelihood=model_likelihood,
                     site_id=args.site,
-                    epochs=args.epochs,
-                    num_trials=args.num_trials,)
+                    num_trials=args.num_trials,
+                    **extras)
 
 # Handling tuning. Hmm, might be better to tuck this away, potentially in yaml
+# TO DOS: Add learning rate option
 if args.tune:
     if args.model == "BlockRNN":
         forecaster.tune({
@@ -98,6 +95,7 @@ if args.tune:
             "model": ["RNN", "GRU", "LSTM"],
             "n_rnn_layers": [2, 3, 4, 5],
             "add_encoders": ["past"],
+            "lr": [1e-3, 1e-4, 1e-5],
         })
     elif args.model == "TCN":
         forecaster.tune({
@@ -105,6 +103,7 @@ if args.tune:
             "kernel_size": [2, 3, 4, 5],
             "num_filters": [2, 3, 4, 5],
             "add_encoders": ["past"],
+            "lr": [1e-3, 1e-4, 1e-5],
         })
     elif args.model == "RNN":
         forecaster.tune({
@@ -113,6 +112,7 @@ if args.tune:
             "model": ["RNN", "GRU", "LSTM"],
             "n_rnn_layers": [2, 3, 4, 5],
             "add_encoders": ["future"],
+            "lr": [1e-3, 1e-4, 1e-5],
         })
     elif args.model == "Transformer":
         forecaster.tune({
@@ -121,14 +121,15 @@ if args.tune:
             "num_encoder_layers": [2, 3, 4],
             "num_decoder_layers": [2, 3, 4],
             "add_encoders": ["past"],
+            "lr": [1e-3, 1e-4, 1e-5],
         })
     elif args.model == "NLinear":
         forecaster.tune({
             "input_chunk_length": [60, 180, 360, 540],
             "const_init": [True, False],
-            "normalize": [True, False],
             "batch_size": [16, 32, 64, 128],
             "add_encoders": ["past_and_future"],
+            "lr": [1e-3, 1e-4, 1e-5],
         })
     elif args.model == "DLinear":
         forecaster.tune({
@@ -137,17 +138,12 @@ if args.tune:
             "const_init": [True, False],
             "batch_size": [16, 32, 64, 128],
             "add_encoders": ["past_and_future"],
+            "lr": [1e-3, 1e-4, 1e-5],
         })
     elif args.model == "XGB":
         forecaster.tune({
-            "lags" : [[-i for i in range(1, 60)],
-                      [-i for i in range(1, 180)],
-                      [-i for i in range(1, 360)],
-                      [-i for i in range(1, 540)]],
-            "lags_past_covariates" : [[-i for i in range(1, 60)],
-                                      [-i for i in range(1, 180)],
-                                      [-i for i in range(1, 360)],
-                                      [-i for i in range(1, 540)]],
+            "lags" : [60, 180, 360, 540],
+            "lags_past_covariates" : [60, 180, 360, 540],
             "add_encoders": ["past"],
         })
     elif args.model == "NBeats":
@@ -157,38 +153,32 @@ if args.tune:
             "num_stacks": [1, 2, 3, 4],
             "num_layers": [1, 2, 4, 8],
             "add_encoders": ["past"],
+            "lr": [1e-3, 1e-4, 1e-5],
         })
     elif args.model == "Linear":
         forecaster.tune({
-            "lags" : [[-i for i in range(1, 60)],
-                      [-i for i in range(1, 180)],
-                      [-i for i in range(1, 360)],
-                      [-i for i in range(1, 540)]],
-            "lags_past_covariates" : [[-i for i in range(1, 60)],
-                                      [-i for i in range(1, 180)],
-                                      [-i for i in range(1, 360)],
-                                      [-i for i in range(1, 540)]],
+            "lags" : [60, 180, 360, 540],
+            "lags_past_covariates" : [60, 180, 360, 540],
             "add_encoders": ["past"],
         })
     elif args.model == "TFT":
         forecaster.tune({
             "input_chunk_length": [60, 180, 360, 540],
-            "hidden_size": [16, 64, [64, 64], [64, 64, 64]],
+            "hidden_size": [16, 64, 128, 256],
             "full_attention": [True, False],
             "lstm_layers": [1, 2, 3, 4],
             "add_encoders": ["past_and_future"],
+            "lr": [1e-3, 1e-4, 1e-5],
         })
 
-# Read and write to script to keep track of hyperparameters
-forecaster.make_forecasts()
-
-# Need to do work here on putting tuned hyperparameters in a yaml
+# Adding hyperparameters to a yaml file to use later
 if args.tune:
     with open(f"hyperparameters/tuned/{args.model}.yaml", 'w') as file:
         tuned_hyperparams = {"model_hyperparameters": forecaster.hyperparams, 
                              "model_likelihood": hyperparams_dict["model_likelihood"]}
+        
         yaml.dump(tuned_hyperparams, file, default_flow_style=False)
-        # You also need to deal with lags
+        
+forecaster.make_forecasts()
 
-
-print(f"Runtime: {time.time() - start:.0f} seconds")
+print(f"Runtime for {args.model} on {args.target} at {args.site}: {time.time() - start:.0f} seconds")
