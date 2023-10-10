@@ -5,7 +5,7 @@ models=("BlockRNN" "TCN" "Transformer" "NLinear" "DLinear" "NBEATS"
 
 # Iterating over the models listed above
 for model in "${models[@]}"; do
-  python train_tune.py --model "$model" --target temperature --site POSE \
+  python train_tune.py --model "$model" --target oxygen --site POSE \
     --date 2023-03-09 --epochs 1 --test_tuned
 done
 
@@ -13,6 +13,6 @@ done
 models=("RNN" "TFT")
 
 for model in "${models[@]}"; do
-  python train_tune.py --model "$model" --target temperature --site POSE \
+  python train_tune.py --model "$model" --target oxygen --site POSE \
     --date 2023-03-09 --epochs 1 --nocovs --test_tuned
 done

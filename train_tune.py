@@ -16,11 +16,6 @@ import yaml
 start = time.time()
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
-# I want to hyperparameters from a yaml in training_hyper...
-# and save best fit hypers into tuned_hyper..
-for dir in ["tuned_hyperparameters/", "forecasts/"]:
-    if not os.path.exists(dir):
-        os.makedirs(dir)
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model", default="BlockRNN", type=str)
@@ -35,13 +30,13 @@ parser.add_argument("--test_tuned", default=False, action="store_true")
 parser.add_argument("--verbose", default=False, action="store_true")
 args = parser.parse_args()
 
-# Load hypers
-hyperparams_loc = f"hyperparameters/train/{args.model}"
+# Loading hyperparameters
+hyperparams_loc = f"hyperparameters/train/{args.target}/{args.model}"
 if args.test_tuned:
-    hyperparams_loc = f"hyperparameters/tuned/{args.model}"
+    hyperparams_loc = f"hyperparameters/tuned/{args.target}/{args.model}"
 with open(f"{hyperparams_loc}.yaml") as f:
     hyperparams_dict = yaml.safe_load(f)
-# And dealing with the tricky inputs of likelihoods and lags
+# Dealing with the tricky inputs of likelihoods
 model_likelihood = {"QuantileRegression": 
                        {"likelihood": QuantileRegression([0.01, 0.05, 0.1, 
                                                           0.3, 0.5, 0.7, 
@@ -49,8 +44,6 @@ model_likelihood = {"QuantileRegression":
                     "Quantile": {"likelihood": "quantile"},
                     "Gaussian": GaussianLikelihood(),
                     "None": None}[hyperparams_dict["model_likelihood"]]
-    
-# Need to accomodate options for quantile regression vs gaussian vs dropout
 
 # Using data as covariates besides the target series
 covariates_list = ["air_tmp", "chla", "temperature", "oxygen"]
@@ -72,7 +65,6 @@ if args.tune:
 # Instantiating the model
 extras = {"epochs": args.epochs,
           "verbose": args.verbose,}
-    
 forecaster = BaseForecaster(model=args.model,
                     target_variable_column_name=args.target,
                     data_preprocessor=data_preprocessor,
@@ -146,7 +138,7 @@ if args.tune:
             "lags_past_covariates" : [60, 180, 360, 540],
             "add_encoders": ["past"],
         })
-    elif args.model == "NBeats":
+    elif args.model == "NBEATS":
         forecaster.tune({
             "input_chunk_length": [60, 180, 360, 540],
             "generic_architecture": [True, False],
@@ -172,8 +164,13 @@ if args.tune:
         })
 
 # Adding hyperparameters to a yaml file to use later
+
 if args.tune:
-    with open(f"hyperparameters/tuned/{args.model}.yaml", 'w') as file:
+    # Making sure that there is a directory to save hypers in
+    if not os.path.exists(f"hyperparameters/tuned/{args.target}"):
+        os.makedirs(f"hyperparameters/tuned/{args.target}")
+    # Saving the hyperparameters in a yaml file that can be accessed with this script
+    with open(f"hyperparameters/tuned/{args.target}/{args.model}.yaml", 'w') as file:
         tuned_hyperparams = {"model_hyperparameters": forecaster.hyperparams, 
                              "model_likelihood": hyperparams_dict["model_likelihood"]}
         
