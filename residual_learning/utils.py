@@ -196,11 +196,16 @@ class TimeSeriesPreprocessor():
                     # and avoiding leap year errors
                     try:
                         mean, std = self.doy_dict[var].loc[min(date.dayofyear, 365)]
+                        if np.isnan(mean):
+                            mean = self.doy_dict[var]['mean'].median()
+                        if np.isnan(std):
+                            std = self.doy_dict[var]['std'].median()
                     except:
                         # If there is an issue, use the global mean and std
-                        mean = self.doy_dict[var]['mean'].mean()
-                        std = self.doy_dict[var]['std'].mean()
+                        mean = self.doy_dict[var]['mean'].median()
+                        std = self.doy_dict[var]['std'].median()
                     stitched_df.loc[date] = np.random.normal(mean, std, size=(500,))
+                    import pdb; pdb.set_trace()
         
         stitched_series = TimeSeries.from_times_and_values(
                                     stitched_df.index, 
