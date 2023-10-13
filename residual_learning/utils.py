@@ -54,49 +54,50 @@ def crps(forecast, observed):
 
 class HistoricalForecaster():
     def __init__(self,
-                 data_preprocessor: Optional = None,
-                 output_csv_name: Optional[str] = "historical_forecaster_output.csv",
-                 validation_split_date: Optional[str] = None, #YYYY-MM-DD
-                 forecast_horizon: Optional[int] = 30,
+                 targets: Optional = None,
                  site_id: Optional[str] = None,
-                 target_variable: Optional[str] = None,
+                 target_variable: Optional[str] = "oxygen",
+                 output_csv_name: Optional[str] = "historical_forecaster_output.csv",
+                 validation_split_date: Optional[str] = "2023-03-09", #YYYY-MM-DD
+                 forecast_horizon: Optional[int] = 30,
+                 datetime_column_name: Optional[str] = "datetime",
                  ):
-        self.data_preprocessor = data_preprocessor
+        self.targets = targets
+        # Changing the date from a string to a datetime64 object
+        self.targets['datetime'] = pd.to_datetime(self.targets.datetime)
+        self.target_variable = target_variable
         self.output_csv_name = output_csv_name
         self.validation_split_date = validation_split_date
         self.forecast_horizon = forecast_horizon
+        self.datetime_column_name = datetime_column_name
         self.site_id = site_id
-        self.target_variable = target_variable
         self._preprocess_data()
-        # Using the medians of the GP filter
-        median_df = self.training_set.median().pd_dataframe()
-        median_df["timestamp"] = pd.to_datetime(median_df.index)
-        median_df["day_of_year"] = median_df["timestamp"].dt.dayofyear
-        
-        # Computing average and std for doy's 
-        self.doy_df = median_df.groupby(['day_of_year'])['0'].agg(['mean', 'std'])
 
     def _preprocess_data(self):
-        stitched_series_dict = self.data_preprocessor.sites_dict[self.site_id]
-        # If there was failure when doing the GP fit then we can't do preprocessing
-        if self.target_variable in \
-                self.data_preprocessor.sites_dict_null[self.site_id]:
-            return "Cannot fit this target time series as no GP fit was performed."
-        self.inputs = stitched_series_dict[self.target_variable]
-
-        # Splitting training and validation set
+        # Doing some basic filtering and tidying
+        site_df = self.targets.loc[self.targets.site_id == self.site_id]
+        tidy_df = pd.melt(site_df, 
+                          id_vars=['datetime', 'site_id'], 
+                          var_name='variable', 
+                          value_name='observation')
+        variable_df = tidy_df.loc[tidy_df.variable == self.target_variable]
+        # Cutting off before the validation split date
         self.year = int(self.validation_split_date[:4])
         month = int(self.validation_split_date[5:7])
         day = int(self.validation_split_date[8:])
         split_date = pd.Timestamp(year=self.year, month=month, day=day)
-        self.training_set, self.validation_set = self.inputs.split_before(split_date)
+        variable_df = variable_df[variable_df["datetime"] < split_date]
+        # Now finding the mean and std according to day of the year
+        variable_df["day_of_year"] = variable_df["datetime"].dt.dayofyear
+        self.doy_df = variable_df.groupby(['day_of_year'])['observation'].agg(['mean', 'std'])
+    
 
     def make_forecasts(self):
         """
         This function finds the historical mean and var, and uses these statistics for
         the forecast
         """
-        # Filtering the previously computed averages and std for our dates of interest
+        # Getting the doys for the forecast window
         forecast_doys = pd.date_range(start=self.validation_split_date, 
                                       periods=self.forecast_horizon, 
                                       freq='D').dayofyear
@@ -108,32 +109,22 @@ class HistoricalForecaster():
             target_date = base_date + timedelta(days=day_of_year - 1)
             return target_date
 
+        # Drawing samples from a gaussian centered at historical mean and std
         samples = np.array([np.random.normal(self.doy_df.loc[self.doy_df.index == doy]["mean"],
-                                    self.doy_df.loc[self.doy_df.index == doy]["std"]/2,
+                                    self.doy_df.loc[self.doy_df.index == doy]["std"],
                                     size=(1, 500)) for doy in forecast_df.index])
 
         # Now creating an index going from doy to date
         date_index = [day_of_year_to_date(self.year, day) for day in forecast_df.index]
         forecast_df.index = date_index
 
-        
+        # Putting together the forecast timeseries
         self.forecast_df = forecast_df
         self.forecast_ts = TimeSeries.from_times_and_values(forecast_df.index, samples)
 
-    def plot(self):
-        fig, ax1 = plt.subplots()
-        ax1.plot(self.forecast_df.index, 
-                 self.forecast_df["mean"], 
-                 label="historical",
-                 linewidth=2)
-        ax1.fill_between(self.forecast_df.index, 
-                         self.forecast_df["mean"] - self.forecast_df["std"], 
-                         self.forecast_df["mean"] + self.forecast_df["std"],
-                         alpha=0.2,)
-        fig.autofmt_xdate()
-        plt.legend()
 
     def get_residuals(self):
+        # This needs to be re-examined!!!
         residual_list = []
         # Going through each date and finding the difference between the doy historical mean and
         # the observed value
@@ -144,7 +135,7 @@ class HistoricalForecaster():
             residual = observed - historical_mean
             residual_list.append(residual)
 
-        self.residuals = TimeSeries.from_times_and_values(self.training_set.time_index, residual_list) 
+        self.residuals = TimeSeries.from_times_and_values(self.training_set.time_index, residual_list)  
         
 
 class TimeSeriesPreprocessor():
@@ -153,21 +144,27 @@ class TimeSeriesPreprocessor():
                  load_dir_name: Optional[str] = "preprocessed_timeseries/",
                  datetime_column_name: Optional[str] = "datetime",
                  covariates_names: Optional[list] = None,
+                 validation_split_date: Optional[str] = "2023-03-09",
                  filter_kw_args: Optional[dict] = {"alpha_0": 0.001,
-                                                   "alpha_1": 2,
                                                    "n_restarts_0": 100,
-                                                   "n_restarts_1": 10,
                                                    "num_samples": 500,},
                  ):
         self.input_csv_name = input_csv_name
         self.load_dir_name = load_dir_name
-        self.df = pd.read_csv(self.input_csv_name)
         self.datetime_column_name = datetime_column_name
         self.filter_kw_args = filter_kw_args
         self.sites_dict = {}
         self.sites_dict_null = {}
+
+        self.year = int(validation_split_date[:4])
+        month = int(validation_split_date[5:7])
+        day = int(validation_split_date[8:])
+        self.split_date = pd.Timestamp(year=self.year, month=month, day=day)
+        self.df = pd.read_csv(self.input_csv_name)
+        self.df['datetime'] = pd.to_datetime(self.df.datetime)
+        self.df = self.df[self.df.datetime < self.split_date]
     
-    def make_stitched_series(self, variable_tseries):
+    def make_stitched_series(self, var):
         """
         Returns a time series where the gaps have been filled in via
         Gaussian Process Filters
@@ -178,29 +175,32 @@ class TimeSeriesPreprocessor():
                         alpha=self.filter_kw_args["alpha_0"], 
                         n_restarts_optimizer=self.filter_kw_args["n_restarts_0"])
         
-        gpf_missing_big_gaps = GaussianProcessFilter(kernel=kernel, 
-                        alpha=self.filter_kw_args["alpha_1"], 
-                        n_restarts_optimizer=self.filter_kw_args["n_restarts_1"])
         stitched_series = {}
     
         # Filtering the TimeSeries
         try:
-            filtered = gpf_missing.filter(variable_tseries, 
-                                          num_samples=self.filter_kw_args["num_samples"])
-            filtered_big_gaps = gpf_missing_big_gaps.filter(variable_tseries, 
+            filtered = gpf_missing.filter(self.var_tseries_dict[var], 
                                           num_samples=self.filter_kw_args["num_samples"])
         except:
             return None
     
         # If there is a gap over 7 indices, use big gap filter
-        gap_series = variable_tseries.gaps()
+        gap_series = self.var_tseries_dict[var].gaps()
         stitched_df = filtered.pd_dataframe()
-        replacement_df = filtered_big_gaps.pd_dataframe()
-        
+
+        # For these big gaps, I replace with samples centered on historical mean and std
         for index, row in gap_series.iterrows():
             if row["gap_size"] > 7:
                 for date in pd.date_range(row["gap_start"], row["gap_end"]):
-                    stitched_df.loc[date] = replacement_df.loc[date]
+                    # Finding the mean and std from the doy dictionary
+                    # and avoiding leap year errors
+                    try:
+                        mean, std = self.doy_dict[var].loc[min(date.dayofyear, 365)]
+                    except:
+                        # If there is an issue, use the global mean and std
+                        mean = self.doy_dict[var]['mean'].mean()
+                        std = self.doy_dict[var]['std'].mean()
+                    stitched_df.loc[date] = np.random.normal(mean, std, size=(500,))
         
         stitched_series = TimeSeries.from_times_and_values(
                                     stitched_df.index, 
@@ -216,17 +216,20 @@ class TimeSeriesPreprocessor():
         Performs gap filling and processing of data into format that
         Darts models will accept
         """
+        # Preparing a dataframe
         site_df = self.df.loc[self.df.site_id == site]
         times = pd.to_datetime(site_df[self.datetime_column_name])
         times = pd.DatetimeIndex(times)
+        
+        self.make_doy_dict(site_df)
         variable_list = ["chla", "oxygen", "temperature", "air_tmp"]
-        var_series_dict = {var: TimeSeries.from_times_and_values(times, 
-                                                                 site_df[var], 
+        self.var_tseries_dict = {var: TimeSeries.from_times_and_values(times, 
+                                                                 site_df[[var]], 
                                                                  fill_missing_dates=True,
                                                                  freq="D") 
                                                         for var in variable_list}
 
-        stitched_series_dict = {var: self.make_stitched_series(var_series_dict[var])
+        stitched_series_dict = {var: self.make_stitched_series(var)
                                                     for var in variable_list}
 
         # Deleting keys with none values
@@ -237,6 +240,20 @@ class TimeSeriesPreprocessor():
         self.sites_dict[site] = stitched_series_dict
         self.sites_dict_null[site] = keys_to_remove
 
+    def make_doy_dict(self, site_df):
+        tidy_df = pd.melt(site_df, 
+                          id_vars=['datetime', 'site_id'], 
+                          var_name='variable', 
+                          value_name='observation')
+        # Now finding the mean and std according to day of the year
+        tidy_df["day_of_year"] = tidy_df["datetime"].dt.dayofyear
+        self.doy_dict = {}
+        # Now loop over variables to make a dictionary of doy_df's
+        for variable in ["chla", "oxygen", "temperature", "air_tmp"]:
+            tidy_variable_df = tidy_df.loc[tidy_df.variable == variable]
+            doy_df = tidy_variable_df.groupby(['day_of_year'])['observation'].agg(['mean', 'std'])
+            self.doy_dict[variable] = doy_df
+    
     def save(self):
         # Check if there's a dir already
         if not os.path.exists(self.load_dir_name):
@@ -259,11 +276,7 @@ class TimeSeriesPreprocessor():
         for file in files:
             if file.endswith(".csv"):
                 # Reading in file name
-                try:
-                    site, variable = file.replace(".csv", "").split("_") # Change this to split at "-"
-                except:
-                    site, var1, var2 = file.replace(".csv", "").split("_")
-                    variable = var1 + "_" + var2
+                site, variable = file.replace(".csv", "").split("-") 
                 file_path = os.path.join(self.load_dir_name, file)
                 df = pd.read_csv(file_path)
     
