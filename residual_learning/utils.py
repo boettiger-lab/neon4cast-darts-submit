@@ -205,7 +205,6 @@ class TimeSeriesPreprocessor():
                         mean = self.doy_dict[var]['mean'].median()
                         std = self.doy_dict[var]['std'].median()
                     stitched_df.loc[date] = np.random.normal(mean, std, size=(500,))
-                    import pdb; pdb.set_trace()
         
         stitched_series = TimeSeries.from_times_and_values(
                                     stitched_df.index, 
