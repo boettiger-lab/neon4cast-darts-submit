@@ -90,6 +90,20 @@ class HistoricalForecaster():
         # Now finding the mean and std according to day of the year
         variable_df["day_of_year"] = variable_df["datetime"].dt.dayofyear
         self.doy_df = variable_df.groupby(['day_of_year'])['observation'].agg(['mean', 'std'])
+        global_mean = variable_df["observation"].mean()
+        global_std = variable_df["observation"].std()
+        # Confirm that there are 365 days, if there aren't fill in with na
+        for doy in range(1, 366):
+            try:
+                self.doy_df.loc[doy]
+            except:
+                self.doy_df.loc[doy] = [np.nan, np.nan]
+        # If there are persistent gaps in the data, fill in with global mean and std
+        for index, row in self.doy_df.iterrows():
+            if np.isnan(row["mean"]):
+                self.doy_df.loc[index]["mean"] = global_mean
+            if np.isnan(row["std"]):
+                self.doy_df.loc[index]["std"] = global_std
     
 
     def make_forecasts(self):
@@ -114,13 +128,19 @@ class HistoricalForecaster():
                                     self.doy_df.loc[self.doy_df.index == doy]["std"],
                                     size=(1, 500)) for doy in forecast_df.index])
 
-        # Now creating an index going from doy to date
-        date_index = [day_of_year_to_date(self.year, day) for day in forecast_df.index]
-        forecast_df.index = date_index
-
-        # Putting together the forecast timeseries
-        self.forecast_df = forecast_df
-        self.forecast_ts = TimeSeries.from_times_and_values(forecast_df.index, samples)
+        # Excluding case where there is no sensor data at all for that site
+        if not np.isnan(samples.mean()):
+            # Now creating an index going from doy to date
+            date_index = [day_of_year_to_date(self.year, day) for day in forecast_df.index]
+            forecast_df.index = date_index
+    
+            # Putting together the forecast timeseries
+            self.forecast_df = forecast_df
+            self.forecast_ts = TimeSeries.from_times_and_values(forecast_df.index, samples)
+            
+        else:
+            self.forecast_df = None
+            self.forecast_ts = None
 
 
     def get_residuals(self):

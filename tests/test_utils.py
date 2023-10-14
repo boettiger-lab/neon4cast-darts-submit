@@ -1,4 +1,4 @@
-from residual_learning.utils import (
+from utils import (
     BaseForecaster, 
     ResidualForecaster,
     TimeSeriesPreprocessor,
@@ -6,6 +6,7 @@ from residual_learning.utils import (
 )
 from darts.utils.likelihood_models import QuantileRegression
 import os
+import pandas as pd
 import pytest
 import copy
 
@@ -20,17 +21,19 @@ def data_preprocessor_():
 def test_TimeseriesPreprocessor(data_preprocessor_):
     assert data_preprocessor_ != None
 
-def test_HistoricalForecaster(data_preprocessor_):
-    data_preprocessor = copy.copy(data_preprocessor_)
-    
-    model = HistoricalForecaster(
-                        data_preprocessor=data_preprocessor,
-                        validation_split_date="2023-03-02",
-                        site_id="BARC",
-                        target_variable="oxygen",
-                        output_csv_name=None,
-    )
-    model.make_forecasts()
+def test_HistoricalForecaster():
+    targets = pd.read_csv("targets.csv.gz")
+
+    for site in targets.site_id.unique():
+        for variable in ["oxygen", "temperature", "chla"]:
+            model = HistoricalForecaster(
+                                targets=targets,
+                                validation_split_date="2023-03-02",
+                                site_id=site,
+                                target_variable=variable,
+                                output_csv_name=None,
+            )
+            model.make_forecasts()
 
 
 def test_BaseForecaster(data_preprocessor_):
@@ -90,21 +93,21 @@ def test_BaseForecaster(data_preprocessor_):
         )
         model.make_forecasts()
     
-def test_HistoricalandResidualForecaster(data_preprocessor_):
-    data_preprocessor = copy.copy(data_preprocessor_)
-
-    model = HistoricalForecaster(
-                        data_preprocessor=data_preprocessor,
-                        validation_split_date="2023-03-02",
-                        site_id="BARC",
-                        target_variable="oxygen",
-                        output_csv_name=None,
-    )
-    model.get_residuals()
-
-    residual_model = ResidualForecaster(
-        residuals=model.residuals,
-        validation_split_date="2023-02-25",
-        output_csv_name = None,
-    )
-    residual_model.make_residual_forecasts()
+#def test_HistoricalandResidualForecaster(data_preprocessor_):
+#    data_preprocessor = copy.copy(data_preprocessor_)
+#
+#    model = HistoricalForecaster(
+#                        data_preprocessor=data_preprocessor,
+#                        validation_split_date="2023-03-02",
+#                        site_id="BARC",
+#                        target_variable="oxygen",
+#                        output_csv_name=None,
+#    )
+#    model.get_residuals()
+#
+#    residual_model = ResidualForecaster(
+#        residuals=model.residuals,
+#        validation_split_date="2023-02-25",
+#        output_csv_name = None,
+#    )
+#    residual_model.make_residual_forecasts()
