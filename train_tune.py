@@ -2,7 +2,7 @@ from darts.utils.likelihood_models import (
                 GaussianLikelihood,
                 QuantileRegression
 )
-from residual_learning.utils import (
+from utils import (
                 BaseForecaster, 
                 ResidualForecaster,
                 TimeSeriesPreprocessor,
@@ -15,7 +15,6 @@ import json
 import yaml
 start = time.time()
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model", default="BlockRNN", type=str)
@@ -23,12 +22,24 @@ parser.add_argument("--target", default="oxygen", type=str)
 parser.add_argument("--site", default="BARC", type=str)
 parser.add_argument("--date", default="2023-02-26", type=str)
 parser.add_argument("--tune", default=False, action="store_true")
-parser.add_argument("--epochs", default=500, type=int)
+parser.add_argument("--epochs", default=200, type=int)
 parser.add_argument("--num_trials", default=1, type=int)
 parser.add_argument("--nocovs", default=False, action="store_true")
 parser.add_argument("--test_tuned", default=False, action="store_true")
 parser.add_argument("--verbose", default=False, action="store_true")
+parser.add_argument("--device", default=0, type=int)
 args = parser.parse_args()
+
+# For non-quantile regression, add 2 CL flags, one to store true another
+# to say which non-quantile regression to use, also need to save these differently
+
+# Need to flag to say forecast didn't use covariates; also need to be careful with
+# time axis encoder here, need to save these differently
+
+# Save weights of regular runs; write a script to load those weights and use with residual forecaster
+
+# Selecting the device
+os.environ["CUDA_VISIBLE_DEVICES"] = "1" if args.device else "0"
 
 # Loading hyperparameters
 hyperparams_loc = f"hyperparameters/train/{args.target}/{args.model}"
@@ -66,7 +77,7 @@ if args.tune:
 extras = {"epochs": args.epochs,
           "verbose": args.verbose,}
 forecaster = BaseForecaster(model=args.model,
-                    target_variable_column_name=args.target,
+                    target_variable=args.target,
                     data_preprocessor=data_preprocessor,
                     covariates_names=covariates_list,
                     output_csv_name=f"{output_csv_name}.csv",
@@ -109,7 +120,7 @@ if args.tune:
     elif args.model == "Transformer":
         forecaster.tune({
             "input_chunk_length": [60, 180, 360, 540],
-            "nhead": [2, 4, 8, 10],
+            "nhead": [1],
             "num_encoder_layers": [2, 3, 4],
             "num_decoder_layers": [2, 3, 4],
             "add_encoders": ["past"],

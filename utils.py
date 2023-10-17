@@ -27,6 +27,7 @@ import ray
 import CRPS.CRPS as forecastscore
 import os
 import optuna
+import pdb
 import argparse
 import copy
 import numpy as np
@@ -38,12 +39,11 @@ def crps(forecast, observed):
     Returns an array of CRPS scores 
     """
     forecast_array = forecast.pd_dataframe().values
-    observed_array = observed.median().pd_series().values
 
     crps_scores = []
     for i in range(len(forecast_array)):
         # Note forecastscore is CRPS.CRPS
-        crps, _, __ = forecastscore(forecast_array[i], observed_array[i]).compute()
+        crps, _, __ = forecastscore(forecast_array[i], observed[i]).compute()
         crps_scores.append(crps)
 
     crps_scores = TimeSeries.from_times_and_values(forecast.time_index, 
@@ -128,7 +128,7 @@ class HistoricalForecaster():
                                     self.doy_df.loc[self.doy_df.index == doy]["std"],
                                     size=(1, 500)) for doy in forecast_df.index])
 
-        # Excluding case where there is no sensor data at all for that site
+        # Catching case where there is no sensor data at all for that site
         if not np.isnan(samples.mean()):
             # Now creating an index going from doy to date
             date_index = [day_of_year_to_date(self.year, day) for day in forecast_df.index]
@@ -182,7 +182,7 @@ class TimeSeriesPreprocessor():
         self.split_date = pd.Timestamp(year=self.year, month=month, day=day)
         self.df = pd.read_csv(self.input_csv_name)
         self.df['datetime'] = pd.to_datetime(self.df.datetime)
-        self.df = self.df[self.df.datetime < self.split_date]
+        self.df = self.df[self.df.datetime <= self.split_date]
     
     def make_stitched_series(self, var):
         """
@@ -244,7 +244,20 @@ class TimeSeriesPreprocessor():
         site_df = self.df.loc[self.df.site_id == site]
         times = pd.to_datetime(site_df[self.datetime_column_name])
         times = pd.DatetimeIndex(times)
-        
+
+        # Dealing with no data being included up until splitting date
+        if times[-1] != self.split_date:
+            new_row = pd.DataFrame({'datetime': [self.split_date], 
+                                    'site_id': [site], 
+                                    'chla': [np.nan], 
+                                    'oxygen': [np.nan], 
+                                    'temperature': [np.nan], 
+                                    'air_tmp': [np.nan]})
+            site_df = pd.concat([site_df, new_row], 
+                                ignore_index=True).reset_index(drop=True)
+            times = pd.to_datetime(site_df[self.datetime_column_name])
+            times = pd.DatetimeIndex(times)
+
         self.make_doy_dict(site_df)
         variable_list = ["chla", "oxygen", "temperature", "air_tmp"]
         self.var_tseries_dict = {var: TimeSeries.from_times_and_values(times, 
@@ -260,6 +273,14 @@ class TimeSeriesPreprocessor():
         keys_to_remove = [key for key, value in stitched_series_dict.items() if value == None]
         for key in keys_to_remove:
             del stitched_series_dict[key]
+
+        # Checking that last date of stitched series is the validation split date
+        for var in stitched_series_dict.keys():
+            last_date = stitched_series_dict[var].time_index[-1]
+            if last_date != self.split_date:
+                raise Exception("Error with dates between" +\
+                                " split date and the last observation in" +\
+                                " the stitched series.")
 
         self.sites_dict[site] = stitched_series_dict
         self.sites_dict_null[site] = keys_to_remove
@@ -338,16 +359,15 @@ class TimeSeriesPreprocessor():
             self.sites_dict[site][key].plot(color="blue", label=f"{key} @ {site}")
             plt.show()
 
-#@ray.remote
 class BaseForecaster():
     def __init__(self,
                  model: Optional[str] = None,
                  data_preprocessor: Optional = None,
-                 target_variable_column_name: Optional[str] = None,
+                 target_variable: Optional[str] = None,
                  datetime_column_name: Optional[str] = "datetime",
                  covariates_names: Optional[list] = None,
                  output_csv_name: Optional[str] = "residual_forecaster_output.csv",
-                 validation_split_date: Optional[str] = None, #YYYY-MM-DD
+                 validation_split_date: Optional[str] = None, #YYYY-MM-DD n.b. this is inclusive
                  model_hyperparameters: Optional[dict] = None,
                  model_likelihood: Optional[dict] = None,
                  forecast_horizon: Optional[int] = 30,
@@ -357,6 +377,7 @@ class BaseForecaster():
                  num_trials: Optional[int] = 50,
                  seed: Optional[int] = 0,
                  verbose: Optional[bool] = False,
+                 targets_csv: Optional[str] = "targets.csv.gz",
                  ):
         self.model_ = {"BlockRNN": BlockRNNModel, 
                        "TCN": TCNModel, 
@@ -369,12 +390,12 @@ class BaseForecaster():
                        "Linear": LinearRegressionModel,
                        "TFT": TFTModel}[model]
         self.data_preprocessor = data_preprocessor
-        self.target_variable_column_name = target_variable_column_name
+        self.target_variable = target_variable
         self.datetime_column_name = datetime_column_name
         self.covariates_names = covariates_names
         self.covariates = None
         self.output_csv_name = output_csv_name
-        self.validation_split_date = validation_split_date
+        self.split_date = pd.to_datetime(validation_split_date)
         self.forecast_horizon = forecast_horizon
         self.site_id = site_id
         self.epochs = epochs
@@ -383,11 +404,13 @@ class BaseForecaster():
         self.seed = seed
         self.tuned = False
         self.verbose = verbose
+        self.targets_df = pd.read_csv(targets_csv)
         if model_hyperparameters == None:
             self.hyperparams = {"input_chunk_length" : 180}
         else:
             self.hyperparams = model_hyperparameters
         self.model_likelihood = model_likelihood
+        # Try to get validation set from targets and not preprocessor
 
         self._preprocess_data()
         
@@ -399,10 +422,10 @@ class BaseForecaster():
         stitched_series_dict = self.data_preprocessor.sites_dict[self.site_id]
 
         # If there was failure when doing the GP fit then we can't do preprocessing
-        if self.target_variable_column_name in \
+        if self.target_variable in \
                 self.data_preprocessor.sites_dict_null[self.site_id]:
             return "Cannot fit this target time series as no GP fit was performed."
-        self.inputs = stitched_series_dict[self.target_variable_column_name]
+        self.inputs = stitched_series_dict[self.target_variable]
 
         if self.covariates_names is not None:
             # And not using the covariates that did not yield GP fits beforehand
@@ -417,14 +440,8 @@ class BaseForecaster():
                                                               ignore_time_axis=True)
             self.covariates = self.covariates.median()
             
-
-        # Splitting training and validation set
-        year = int(self.validation_split_date[:4])
-        month = int(self.validation_split_date[5:7])
-        day = int(self.validation_split_date[8:])
-        split_date = pd.Timestamp(year=year, month=month, day=day)
         # Taking the median now to accomodate using doy covariates
-        self.training_set, self.validation_set = self.inputs.median().split_before(split_date)
+        self.training_set = self.inputs.median()
 
     def tune(self,
              hyperparameter_dict: Optional[dict]
@@ -433,6 +450,10 @@ class BaseForecaster():
         Sets up Optuna trial to perform hyperparameter tuning
         Input dictionary will be of the form {"hyperparamter": [values to be tested]}
         """
+        self.validation_set = self.get_validation_set()
+        if len(self.validation_set) != self.forecast_horizon:
+            raise Exception(f"There is missing data in the specified forecast window at {self.site_id}. " + \
+                            "This site will not be used for evaluating hyperparameters.")
         # Setting up an optuna Trial
         def objective(trial):
             callback = [PyTorchLightningPruningCallback(trial, monitor="val_loss")]
@@ -448,7 +469,7 @@ class BaseForecaster():
 
             extras = {"verbose": False,
                       "epochs": self.epochs}
-            predict_kws = {"n": len(self.validation_set[:self.forecast_horizon]),
+            predict_kws = {"n": self.forecast_horizon,
                            "num_samples": self.num_samples}
             self.scaler = Scaler()
             # Need to treat transformation differently if models use covariates or not
@@ -464,14 +485,15 @@ class BaseForecaster():
             if self.model_ == XGBModel or self.model_ == LinearRegressionModel:
                 del extras["epochs"]
                 del extras["verbose"]
-        
+
+            
             model.fit(training_set, **extras)
             
             predictions = model.predict(**predict_kws)
             predictions = self.scaler.inverse_transform(predictions)
 
             crps_ = crps(predictions, 
-                        self.validation_set[:self.forecast_horizon],
+                         self.validation_set,
                         )
             
             crps_mean = crps_.mean(axis=0).values()[0][0]
@@ -484,6 +506,26 @@ class BaseForecaster():
         self.hyperparams = study.best_trial.params
         self.tuned = True
 
+    def get_validation_set(self):
+        # take validation_split_date and add number of dates
+        date_range = pd.date_range(self.split_date + pd.DateOffset(days=1), 
+                                   periods=self.forecast_horizon, 
+                                   freq='D')
+        # Filter targets df for site and variable
+        site_df = self.targets_df[self.targets_df["site_id"] == self.site_id]
+        site_var_df_ = site_df[["datetime", self.target_variable]]
+        site_var_df = site_var_df_.copy()
+        site_var_df["datetime"] = pd.to_datetime(site_var_df_["datetime"])
+        validation_df = pd.DataFrame()
+        # Now creating a new dataframe of observed series from the forecast
+        # window
+        for date in date_range:
+            entry = site_var_df[site_var_df.datetime == date]
+            validation_df = pd.concat([validation_df, entry], 
+                                      axis=0).reset_index(drop=True)
+        
+        return validation_df["oxygen"]
+        
     def make_forecasts(self):
         """
         This function fits a Darts model to the training_set
@@ -501,18 +543,25 @@ class BaseForecaster():
                   "epochs": self.epochs}
         predict_kws = {"n": self.forecast_horizon,
                        "num_samples": self.num_samples}
+
+        # Need to account for models that don't use past covariates
         if self.covariates is not None:
+            # Changing to median so that I can use the time axis encoder.
+            # Darts does not allow inputs of mixed dimension.
             training_set, covariates = self.scaler.fit_transform([self.training_set.median(),
                                                                   self.covariates.median()])
             extras["past_covariates"] = covariates
             predict_kws["past_covariates"] = covariates
         else:
             training_set = self.scaler.fit_transform([self.training_set.median()])
-        
+
+        # Regression models don't accept these key word arguments for .fit()
         if self.model_ == XGBModel or self.model_ == LinearRegressionModel:
             del extras["epochs"]
             del extras["verbose"]
 
+        assert training_set.time_index[-1] == self.split_date
+        
         self.model.fit(training_set,
                        **extras)
 
@@ -597,7 +646,6 @@ class BaseForecaster():
    #    for variable, df in df_dict.items():
    #        df.to_csv(f"{self.model}_test/{variable}")
     
-#@ray.remote
 class ResidualForecaster():
     def __init__(self,
                  residuals: Optional[TimeSeries] = None,
