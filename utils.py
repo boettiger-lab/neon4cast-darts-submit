@@ -82,10 +82,8 @@ class HistoricalForecaster():
                           value_name='observation')
         variable_df = tidy_df.loc[tidy_df.variable == self.target_variable]
         # Cutting off before the validation split date
-        self.year = int(self.validation_split_date[:4])
-        month = int(self.validation_split_date[5:7])
-        day = int(self.validation_split_date[8:])
-        split_date = pd.Timestamp(year=self.year, month=month, day=day)
+        split_date = pd.to_datetime(self.validation_split_date)
+        self.year = split_date.year
         variable_df = variable_df[variable_df["datetime"] < split_date]
         # Now finding the mean and std according to day of the year
         variable_df["day_of_year"] = variable_df["datetime"].dt.dayofyear
@@ -117,17 +115,18 @@ class HistoricalForecaster():
                                       freq='D').dayofyear
         forecast_df = self.doy_df.loc[forecast_doys]
 
-        # Function to give date from the numerical doy
-        def day_of_year_to_date(year, day_of_year):
-            base_date = datetime(year, 1, 1)
-            target_date = base_date + timedelta(days=day_of_year - 1)
-            return target_date
 
         # Drawing samples from a gaussian centered at historical mean and std
         samples = np.array([np.random.normal(self.doy_df.loc[self.doy_df.index == doy]["mean"],
                                     self.doy_df.loc[self.doy_df.index == doy]["std"],
                                     size=(1, 500)) for doy in forecast_df.index])
 
+        # Function to give date from the numerical doy
+        def day_of_year_to_date(year, day_of_year):
+            base_date = datetime(year, 1, 1)
+            target_date = base_date + timedelta(days=day_of_year - 1)
+            return target_date
+            
         # Catching case where there is no sensor data at all for that site
         if not np.isnan(samples.mean()):
             # Now creating an index going from doy to date
@@ -150,12 +149,14 @@ class HistoricalForecaster():
         # the observed value
         for date in self.training_set.time_index:
             doy = date.dayofyear
-            observed = self.training_set.slice_n_points_after(date, 1).median().values()[0][0]
+            observed = self.training_set.slice_n_points_after(date, 
+                                                              1).median().values()[0][0]
             historical_mean = self.doy_df.loc[doy]["mean"]
             residual = observed - historical_mean
             residual_list.append(residual)
 
-        self.residuals = TimeSeries.from_times_and_values(self.training_set.time_index, residual_list)  
+        self.residuals = TimeSeries.from_times_and_values(self.training_set.time_index, 
+                                                          residual_list)  
         
 
 class TimeSeriesPreprocessor():
@@ -174,7 +175,6 @@ class TimeSeriesPreprocessor():
         self.datetime_column_name = datetime_column_name
         self.filter_kw_args = filter_kw_args
         self.sites_dict = {}
-        self.sites_dict_null = {}
 
         self.year = int(validation_split_date[:4])
         month = int(validation_split_date[5:7])
@@ -310,16 +310,16 @@ class TimeSeriesPreprocessor():
                 self.sites_dict[site][variable].pd_dataframe()\
                     .to_csv(f"{self.load_dir_name}{site}-{variable}.csv")
 
-    def load(self):
+    def load(self, site):
         # Need to check what are the possible variables that there could be in null, 
         # and when you load a series need to log which ones aren't added
         variables = {"chla", "oxygen", "temperature", "air_tmp"}
-        sites_dict_present = {}
+        variables_present = []
         
         # Need to fill sites_dict and sites_dict_null
         files = os.listdir(self.load_dir_name)
         for file in files:
-            if file.endswith(".csv"):
+            if file.startswith(site):
                 # Reading in file name
                 site, variable = file.replace(".csv", "").split("-") 
                 file_path = os.path.join(self.load_dir_name, file)
@@ -339,19 +339,10 @@ class TimeSeriesPreprocessor():
                 if site not in self.sites_dict.keys():
                     self.sites_dict[site] = {}
                 self.sites_dict[site][variable] = time_series
+                variables_present.append(variable)
     
-                # Need to keep track of the variables over different csv's
-                # for each site
-                if site not in sites_dict_present.keys():
-                    sites_dict_present[site] = [variable]
-                else:
-                    sites_dict_present[site].append(variable)
-    
-    
-        for site in sites_dict_present.keys():
-            variables_present = set(sites_dict_present[site])
-            absent_variables = list(variables - variables_present)
-            self.sites_dict_null[site] = absent_variables
+        # And finding the 
+        self.site_missing_variables = list(variables - set(variables_present))
     
     def plot_by_site(self, site):
         for key in self.sites_dict[site].keys():
@@ -367,7 +358,7 @@ class BaseForecaster():
                  datetime_column_name: Optional[str] = "datetime",
                  covariates_names: Optional[list] = None,
                  output_csv_name: Optional[str] = "residual_forecaster_output.csv",
-                 validation_split_date: Optional[str] = None, #YYYY-MM-DD n.b. this is inclusive
+                 validation_split_date: Optional[str] = "2023-03-09", #YYYY-MM-DD n.b. this is inclusive
                  model_hyperparameters: Optional[dict] = None,
                  model_likelihood: Optional[dict] = None,
                  forecast_horizon: Optional[int] = 30,
@@ -423,13 +414,13 @@ class BaseForecaster():
 
         # If there was failure when doing the GP fit then we can't do preprocessing
         if self.target_variable in \
-                self.data_preprocessor.sites_dict_null[self.site_id]:
+                self.data_preprocessor.site_missing_variables:
             return "Cannot fit this target time series as no GP fit was performed."
         self.inputs = stitched_series_dict[self.target_variable]
 
         if self.covariates_names is not None:
             # And not using the covariates that did not yield GP fits beforehand
-            for null_variable in self.data_preprocessor.sites_dict_null[self.site_id]:
+            for null_variable in self.data_preprocessor.site_missing_variables:
                 self.covariates_names.remove(null_variable)
     
             # Initializing covariates list then concatenating in for loop
@@ -479,13 +470,17 @@ class BaseForecaster():
                 extras["past_covariates"] = covariates
                 predict_kws["past_covariates"] = covariates
             else:
-                training_set = self.scaler.fit_transform([self.training_set.median()])
+                training_set = self.scaler.fit_transform(self.training_set.median())
 
             # Need to delete epochs which aren't used in the regression models
             if self.model_ == XGBModel or self.model_ == LinearRegressionModel:
                 del extras["epochs"]
                 del extras["verbose"]
 
+            assert training_set.time_index[-1] == self.split_date, "There is a" +\
+             " misalignment between the training set and the specified validation" +\
+             " split date. Note that the validation split date is defined to" +\
+             " include the last date of the training set."
             
             model.fit(training_set, **extras)
             
@@ -524,16 +519,16 @@ class BaseForecaster():
             validation_df = pd.concat([validation_df, entry], 
                                       axis=0).reset_index(drop=True)
         
-        return validation_df["oxygen"]
+        return validation_df[self.target_variable]
         
     def make_forecasts(self):
         """
         This function fits a Darts model to the training_set
         """
-        print(self.hyperparams)
+        print(self.hyperparams, self.model_likelihood)
         # Need to handle lags and time axis encoders
         self.hyperparams = self.prepare_hyperparams(self.hyperparams)
-        
+
         self.model = self.model_(**self.hyperparams,
                                  output_chunk_length=self.forecast_horizon,
                                  **self.model_likelihood,
@@ -553,14 +548,17 @@ class BaseForecaster():
             extras["past_covariates"] = covariates
             predict_kws["past_covariates"] = covariates
         else:
-            training_set = self.scaler.fit_transform([self.training_set.median()])
+            training_set = self.scaler.fit_transform(self.training_set.median())
 
         # Regression models don't accept these key word arguments for .fit()
         if self.model_ == XGBModel or self.model_ == LinearRegressionModel:
             del extras["epochs"]
             del extras["verbose"]
 
-        assert training_set.time_index[-1] == self.split_date
+        assert training_set.time_index[-1] == self.split_date, "There is a" +\
+         " misalignment between the training set and the specified validation split" +\
+         " date. Note that the validation split date is defined to include the last" +\
+         " date of the training set."
         
         self.model.fit(training_set,
                        **extras)
@@ -609,6 +607,7 @@ class BaseForecaster():
                                                                 ignore_time_axis=True)
 
 
+        # Defining residual as difference between the median and ground truth
         self.residuals = self.historical_ground_truth - self.historical_forecasts.median()
 
     def prepare_hyperparams(self, hyperparams_dict):
