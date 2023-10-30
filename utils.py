@@ -395,6 +395,7 @@ class BaseForecaster():
         self.seed = seed
         self.tuned = False
         self.verbose = verbose
+        self.dropout = None
         self.targets_df = pd.read_csv(targets_csv)
         if model_hyperparameters == None:
             self.hyperparams = {"input_chunk_length" : 180}
@@ -456,7 +457,8 @@ class BaseForecaster():
 
             model = self.model_(**hyperparams,
                                 output_chunk_length=self.forecast_horizon,
-                                **self.model_likelihood)
+                                **self.model_likelihood,
+                                random_state=self.seed)
 
             extras = {"verbose": False,
                       "epochs": self.epochs}
@@ -526,6 +528,7 @@ class BaseForecaster():
         This function fits a Darts model to the training_set
         """
         print(self.hyperparams, self.model_likelihood)
+        
         # Need to handle lags and time axis encoders
         self.hyperparams = self.prepare_hyperparams(self.hyperparams)
 
@@ -563,6 +566,10 @@ class BaseForecaster():
         self.model.fit(training_set,
                        **extras)
 
+        # Accounting for if there is dropout
+        if "dropout" in list(self.model_likelihood.keys()):
+            predict_kws["mc_dropout"] = True
+            
         predictions = self.model.predict(**predict_kws)
         predictions = self.scaler.inverse_transform(predictions)
 
@@ -619,6 +626,9 @@ class BaseForecaster():
             elif hyperparams_dict["add_encoders"] == "past_and_future":
                 hyperparams_dict["add_encoders"] = {'datetime_attribute': {'past': ['dayofyear'], 
                                                                    'future': ['dayofyear']}}
+            elif hyperparams_dict["add_encoders"] == "none":
+                del hyperparams_dict["add_encoders"]
+                
         if "lr" in hyperparams_dict.keys():
             hyperparams_dict["optimizer_kwargs"] = {"lr": hyperparams_dict["lr"]}
             del hyperparams_dict["lr"]

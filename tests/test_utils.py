@@ -28,7 +28,7 @@ def test_HistoricalForecaster():
         for variable in ["oxygen", "temperature", "chla"]:
             model = HistoricalForecaster(
                                 targets=targets,
-                                validation_split_date="2023-03-02",
+                                validation_split_date="2023-03-09",
                                 site_id=site,
                                 target_variable=variable,
                                 output_csv_name=None,
@@ -46,14 +46,14 @@ def test_BaseForecaster(data_preprocessor_):
         model = BaseForecaster(
                         model=model_name,
                         data_preprocessor=data_preprocessor,
-                        target_variable_column_name="oxygen",
+                        target_variable="chla",
                         datetime_column_name="datetime",
                         covariates_names=["chla", "temperature", "air_tmp"],
                         output_csv_name=None,
-                        validation_split_date="2023-03-02",
+                        validation_split_date="2023-03-09",
                         model_hyperparameters={"input_chunk_length": 31},
                         model_likelihood={"likelihood": QuantileRegression([0.05, 0.1, 0.5, 0.9, 0.95])},
-                        site_id="BARC",
+                        site_id="FLNT",
                         epochs=1,
         )
         model.make_forecasts()
@@ -64,12 +64,12 @@ def test_BaseForecaster(data_preprocessor_):
         model = BaseForecaster(
                     model=model_name,
                     data_preprocessor=data_preprocessor,
-                    target_variable_column_name="oxygen",
+                    target_variable="oxygen",
                     datetime_column_name="datetime",
                     output_csv_name=None,
-                    validation_split_date="2023-03-02",
+                    validation_split_date="2023-03-09",
                     model_likelihood={"likelihood": "quantile"},
-                    site_id="BARC",
+                    site_id="ARIK",
                     epochs=1,
                     model_hyperparameters={"lags": [-i for i in range(1, 2)]}
                 )
@@ -81,14 +81,14 @@ def test_BaseForecaster(data_preprocessor_):
         model = BaseForecaster(
                         model=model_name,
                         data_preprocessor=data_preprocessor,
-                        target_variable_column_name="oxygen",
+                        target_variable="temperature",
                         datetime_column_name="datetime",
                         output_csv_name=None,
-                        validation_split_date="2023-03-02",
+                        validation_split_date="2023-03-09",
                         model_likelihood={"likelihood": QuantileRegression([0.05, 0.1, 0.5, 0.9, 0.95])},
                         model_hyperparameters={"input_chunk_length": 31,
                                                "add_encoders": {'datetime_attribute': {'future': ['dayofyear']}}},
-                        site_id="BARC",
+                        site_id="POSE",
                         epochs=1,
         )
         model.make_forecasts()

@@ -1,7 +1,7 @@
 #!/bin/bash
 > logs/test_tune.log
-models=("BlockRNN" "TCN" "Transformer" "NLinear" "DLinear" "NBEATS"
-        "XGB" "Linear")
+models=("BlockRNN" "TCN" "Transformer" "NLinear" "DLinear" "NBEATS")
+# Removed XGB and Linear as they are costly
 
 # Iterating over the models listed above
 for model in "${models[@]}"; do
