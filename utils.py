@@ -38,7 +38,7 @@ def crps(forecast, observed):
     """
     Returns an array of CRPS scores 
     """
-    forecast_array = forecast.pd_dataframe().values
+    forecast_array = forecast.pd_dataframe(suppress_warnings=True).values
 
     crps_scores = []
     for i in range(len(forecast_array)):
