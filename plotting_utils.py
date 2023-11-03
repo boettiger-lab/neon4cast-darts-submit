@@ -15,6 +15,22 @@ import CRPS.CRPS as forecastscore
 from darts.metrics import rmse
 import matplotlib as mpl
 
+def create_rmse_df_from_dict(data_dict):
+    # Initialize empty lists to store the data
+    keys = []
+    historical_rmse = []
+    forecast_rmse = []
+
+    # Iterate through the dictionary and extract the data
+    for key, value in data_dict.items():
+        keys.append(key)
+        historical_rmse.append(value['rmse_historical'])
+        forecast_rmse.append(value['rmse_forecast'])
+
+    # Create a DataFrame from the extracted data
+    df = pd.DataFrame({'site_id': keys, 'rmse_historical': historical_rmse, 'rmse_forecast': forecast_rmse})
+
+    return df
 
 def get_validation_series(targets_df, site_id, target_variable, date, forecast_horizon):
     # Being careful here with the date, note that I am matching the forecast,
@@ -43,6 +59,7 @@ def get_validation_series(targets_df, site_id, target_variable, date, forecast_h
         times,
         validation_df[[target_variable]],
         fill_missing_dates=True,
+        freq="D",
     )
     
     return validation_series
@@ -71,12 +88,87 @@ def filter_forecast_df(forecast_df, validation_series):
     filtered_forecast_ts = TimeSeries.from_times_and_values(
         times, 
         values, 
-        fill_missing_dates=False
     )
 
     return filtered_forecast_ts, validation_series
 
-def make_plots(models_list, targets_df, site_id, target_variable, plot_name=None):
+def modify_score_dict(model, targets_df, target_variable, site_id, suffix, score_dict, score_rmse=False):
+    file = model + suffix
+    csv_name = f"forecasts/{site_id}/{target_variable}/{file}"
+    try:
+        forecast_df = pd.read_csv(f"{csv_name}.csv")
+    except:
+        return score_dict
+    forecast_df["datetime"] = pd.to_datetime(forecast_df["datetime"])
+    times = pd.DatetimeIndex(forecast_df["datetime"])
+    forecast_df = forecast_df.set_index("datetime")
+
+    # Getting the validation set from targets
+    forecast_horizon = len(forecast_df)
+    validation_series = get_validation_series(
+        targets_df, 
+        site_id, 
+        target_variable, 
+        times[0], 
+        forecast_horizon,
+    )
+
+    # If there is no validation set at the site skip
+    if len(validation_series) == 0:
+        return score_dict
+
+    try:
+        filtered_model_forecast, filtered_validation_series = filter_forecast_df(
+            forecast_df, 
+            validation_series
+        )
+    except:
+        return score_dict
+
+    # Initialize in case site id is empty at the site
+    if site_id not in score_dict:
+        score_dict[site_id] = {}
+        
+    # Computing CRPS and recording
+    if score_rmse:
+        filtered_validation_ts = TimeSeries.from_times_and_values(
+            filtered_validation_series.index, 
+            filtered_validation_series.values, 
+            fill_missing_dates=False
+        )
+        rmse_score = rmse(filtered_validation_ts, filtered_model_forecast)
+        score_dict[site_id]["rmse_forecast"] = rmse_score
+    else:
+        crps_scores = crps(filtered_model_forecast, filtered_validation_series)
+        score_dict[site_id]["crps_forecast"] = crps_scores.pd_dataframe().values[:, 0]
+        
+    # Now, making the forecast based off of historical mean and std
+    historical_model = HistoricalForecaster(
+        targets=targets_df,
+        site_id=site_id,
+        target_variable=target_variable,
+        output_csv_name=None,
+        validation_split_date=str(times[0])[:10],
+        forecast_horizon=forecast_horizon,
+    )
+    # Computing CRPS of historical forecast and plotting
+    historical_model.make_forecasts()
+    historical_forecast_df = historical_model.forecast_ts.pd_dataframe(
+        suppress_warnings=True
+    )
+    filtered_historical_forecast, filtered_validation_series = filter_forecast_df(
+        historical_forecast_df, 
+        validation_series
+    )
+    if score_rmse:
+        rmse_score = rmse(filtered_validation_ts, filtered_historical_forecast)
+        score_dict[site_id]["rmse_historical"] = rmse_score
+    else:
+        crps_scores = crps(filtered_historical_forecast, filtered_validation_series)
+        score_dict[site_id]["crps_historical"] = crps_scores.pd_dataframe().values[:, 0]
+    return score_dict
+
+def plot_forecasts(models_list, targets_df, site_id, target_variable, plot_name=None):
     cmap = mpl.colormaps["tab10"]
     colors = cmap.colors
     # Loading the forecast csv and creating a time series
@@ -124,7 +216,7 @@ def make_plots(models_list, targets_df, site_id, target_variable, plot_name=None
             os.makedirs(f"plots/{site_id}/{target_variable}/")
         plt.savefig(f"plots/{site_id}/{target_variable}/{plot_name}")
 
-def make_crps_seq_plot(models_list, targets_df, site_id, target_variable, plot_name=None):
+def plot_crps_seq(models_list, targets_df, site_id, target_variable, plot_name=None):
     cmap = mpl.colormaps["tab20"]
     colors = cmap.colors
     # Loading the forecast csv and creating a time series
@@ -180,7 +272,7 @@ def make_crps_seq_plot(models_list, targets_df, site_id, target_variable, plot_n
             os.makedirs(f"plots/{site_id}/{target_variable}/")
         plt.savefig(f"plots/{site_id}/{target_variable}/{plot_name}")
 
-def make_crps_strip_plot(models_list, targets_df, site_id, target_variable, plot_name=None):
+def plot_crps_strip(models_list, targets_df, site_id, target_variable, plot_name=None):
     cmap = mpl.colormaps["tab20"]
     colors = cmap.colors
     score_dict = {}
@@ -263,7 +355,7 @@ def make_crps_strip_plot(models_list, targets_df, site_id, target_variable, plot
             os.makedirs(f"plots/{site_id}/{target_variable}/")
         plt.savefig(f"plots/{site_id}/{target_variable}/{plot_name}")
 
-def make_rmse_strip_plot(models_list, targets_df, site_id, target_variable, plot_name=None):
+def plot_rmse_strip(models_list, targets_df, site_id, target_variable, plot_name=None):
     # Selecting a colormap that I prefer
     cmap = mpl.colormaps["tab20"]
     colors = cmap.colors
@@ -335,73 +427,17 @@ def make_rmse_strip_plot(models_list, targets_df, site_id, target_variable, plot
             os.makedirs(f"plots/{site_id}/{target_variable}/")
         plt.savefig(f"plots/{site_id}/{target_variable}/{plot_name}")    
 
-def make_crps_strip_plot_bysite(model, targets_df, target_variable, suffix="", plot_name=None):
+def plot_crps_bysite(model, targets_df, target_variable, suffix="", plot_name=None):
 
     plt.figure(figsize=(16, 12))
     score_dict = {}
     
     for site_id in targets_df.site_id.unique():
-        score_dict[site_id] = []
-        file = model + suffix
-        csv_name = f"forecasts/{site_id}/{target_variable}/{file}"
-        # If there is no forecast at the site skip
-        try:
-            forecast_df = pd.read_csv(f"{csv_name}.csv")
-        except:
-            del score_dict[site_id]
-            continue
-        forecast_df["datetime"] = pd.to_datetime(forecast_df["datetime"])
-        times = pd.DatetimeIndex(forecast_df["datetime"])
-        forecast_df = forecast_df.set_index("datetime")
-        
-        # Getting the validation set from targets
-        forecast_horizon = len(forecast_df)
-        validation_series = get_validation_series(
-            targets_df, 
-            site_id, 
-            target_variable, 
-            times[0], 
-            forecast_horizon,
-        )
+        score_dict = modify_score_dict(model, targets_df, target_variable, site_id, suffix, score_dict)
 
-        # If there is no validation set at the site skip
-        if len(validation_series) == 0:
-            del score_dict[site_id]
-            continue
-        
-        filtered_model_forecast, filtered_validation_series = filter_forecast_df(
-            forecast_df, 
-            validation_series
-        )
-    
-        # Computing CRPS and recording
-        scores = crps(filtered_model_forecast, filtered_validation_series)
-        score_dict[site_id] = {"forecast_crps": scores.pd_dataframe().values[:, 0]}
-        
-        # Now, making the forecast based off of historical mean and std
-        historical_model = HistoricalForecaster(
-            targets=targets_df,
-            site_id=site_id,
-            target_variable=target_variable,
-            output_csv_name=None,
-            validation_split_date=str(filtered_model_forecast.time_index[0])[:10],
-            forecast_horizon=forecast_horizon,
-        )
-        # Computing CRPS of historical forecast and plotting
-        historical_model.make_forecasts()
-        historical_forecast_df = historical_model.forecast_ts.pd_dataframe(suppress_warnings=True)
-
-        filtered_historical_forecast, filtered_validation_series = filter_forecast_df(
-            historical_forecast_df, 
-            validation_series
-        )
-        
-        scores = crps(filtered_historical_forecast, filtered_validation_series)
-        score_dict[site_id]["historical_crps"] = scores.pd_dataframe().values[:, 0]
-        
-    score_df = pd.DataFrame([(site_id, data_dict['forecast_crps'][i], data_dict['historical_crps'][i]) \
+    score_df = pd.DataFrame([(site_id, data_dict['crps_forecast'][i], data_dict['crps_historical'][i]) \
                                  for site_id, data_dict in score_dict.items() \
-                                 for i in range(len(data_dict['forecast_crps']))],
+                                 for i in range(len(data_dict['crps_forecast']))],
                             columns=["site_id", f'{model}', 'historical'])
     score_df = pd.melt(score_df, id_vars=["site_id"], var_name="model_type", value_name="crps")
 
@@ -433,4 +469,97 @@ def make_crps_strip_plot_bysite(model, targets_df, target_variable, suffix="", p
             os.makedirs(f"plots/{site_id}/{target_variable}/")
         plt.savefig(f"plots/{site_id}/{target_variable}/{plot_name}")
     
+def plot_score_improvement_bysite(model, targets_df, target_variable, suffix="", plot_name=None):
+
+    plt.figure(figsize=(10, 8))
+    score_dict = {}
     
+    for site_id in targets_df.site_id.unique():
+        score_dict = modify_score_dict(
+            model, 
+            targets_df, 
+            target_variable, 
+            site_id, 
+            suffix, 
+            score_dict
+        )
+        score_dict = modify_score_dict(
+            model, 
+            targets_df, 
+            target_variable, 
+            site_id, 
+            suffix, 
+            score_dict,
+            score_rmse=True
+        )
+
+    rmse_df = create_rmse_df_from_dict(score_dict)
+    crps_df = pd.DataFrame([(site_id, data_dict['crps_forecast'][i], data_dict['crps_historical'][i]) \
+                                 for site_id, data_dict in score_dict.items() \
+                                 for i in range(len(data_dict['crps_forecast']))],
+                            columns=["site_id", 'forecast', 'historical'])
+    crps_df = pd.melt(crps_df, id_vars=["site_id"], var_name="model_type", value_name="crps")
+    crps_means = crps_df.groupby(["site_id", "model_type"])['crps'].mean().reset_index()
+    model_crps_scores = crps_means[crps_means['model_type'] == "forecast"]
+    historical_crps_scores = crps_means[crps_means['model_type'] == "historical"]
+    merged_df =  model_crps_scores.merge(
+        historical_crps_scores, 
+        on='site_id', 
+        suffixes=('_forecast', '_historical'),
+    )
+    merged_df = merged_df.merge(rmse_df, on="site_id")
+    merged_df.drop(
+        ['model_type_forecast', 'model_type_historical'], 
+        axis=1, 
+        inplace=True
+    )
+    melted_df = pd.melt(
+        merged_df, 
+        id_vars=['site_id'], 
+        var_name='crps/rmse', 
+        value_name='value'
+    )
+    melted_df[['score_type', 'model_type']] = melted_df['crps/rmse'].str.split(
+        '_', 
+        expand=True
+    )
+    pivoted_df = melted_df.pivot(
+        index='site_id', 
+        columns=['score_type', 'model_type'], 
+        values='value')
+    pivoted_df.reset_index(inplace=True)
+    custom_palette = {True: 'tab:blue', False: 'indianred'}
+    marker_key = {'crps': 'D', 'rmse': '*'}
+    for metric in ['crps', 'rmse']:
+        pivoted_df[f"{metric}_percent_improvement"] = (
+            (pivoted_df[metric]['historical'] - pivoted_df[metric]['forecast']) /
+            pivoted_df[metric]['historical']
+        ) * 100
+        pivoted_df[f"{metric}_positive"] = pivoted_df[f"{metric}_percent_improvement"] > 0
+        sns.pointplot(pivoted_df, 
+            x="site_id", 
+            y=f"{metric}_percent_improvement", 
+            linestyle="", 
+            marker=marker_key[metric],
+            hue=f"{metric}_positive",
+            palette=custom_palette,
+        )
+        
+    plt.grid(False)
+    plt.ylabel("% Improvement")
+    ax = plt.gca()
+    ax.spines["left"].set_visible(True)
+    ax.spines["bottom"].set_visible(True)
+    plt.xticks(rotation=30)
+    plt.legend(labels=[])
+    plt.title(f"{model+suffix} @ {target_variable}")
+    
+    # Saving the plot if desired
+    if plot_name != None:
+        if not os.path.exists(f"plots/{site_id}/{target_variable}/"):
+            os.makedirs(f"plots/{site_id}/{target_variable}/")
+        plt.savefig(f"plots/{site_id}/{target_variable}/{plot_name}")
+
+def plot_sitewide_comparison(model, target_df, suffix):
+    for target_variable in ['oxygen', 'temperature', 'chla']:
+        plot_score_improvement_bysite(model, target_df, target_variable, suffix=suffix)
