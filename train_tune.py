@@ -20,7 +20,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--model", default="BlockRNN", type=str,
                     help="Specify which Darts model to train with.")
 parser.add_argument("--target", default="oxygen", type=str,
-                    help="Specify which target time series to train on"+\
+                    help="Specify which target time series to train on "+\
                     "[oxygen, temperature, chla].")
 parser.add_argument("--site", default="BARC", type=str,
                     help="Denotes which site to use.")
@@ -79,7 +79,7 @@ if __name__ == "__main__":
                                                               0.9, 0.95, 0.99])},
                         "Quantile": {"likelihood": "quantile"},
                         "Gaussian": {"likelihood": GaussianLikelihood()},
-                        "None": {"dropout": 0.1}}[hyperparams_dict["model_likelihood"]]
+                        "Dropout": {"dropout": 0.1}}[hyperparams_dict["model_likelihood"]]
     
     # Using data as covariates besides the target series
     covariates_list = ["air_tmp", "chla", "temperature", "oxygen"]
@@ -119,85 +119,91 @@ if __name__ == "__main__":
     if args.tune:
         if args.model == "BlockRNN":
             forecaster.tune({
-                "input_chunk_length": [60, 180, 360, 540],
-                "hidden_dim": [16, 32, 64, 126],
+                "input_chunk_length": [180, 360, 540],
+                "hidden_dim": [32, 64, 126],
                 "model": ["RNN", "GRU", "LSTM"],
                 "n_rnn_layers": [2, 3, 4, 5],
-                "add_encoders": ["past"],
+                "add_encoders": ["past", "none"],
+                "batch_size": [32, 64, 128],
                 "lr": [1e-3, 1e-4, 1e-5],
             })
         elif args.model == "TCN":
             forecaster.tune({
-                "input_chunk_length": [60, 180, 360, 540],
+                "input_chunk_length": [180, 360, 540],
                 "kernel_size": [2, 3, 4, 5],
                 "num_filters": [2, 3, 4, 5],
-                "add_encoders": ["past"],
+                "add_encoders": ["past", "none"],
                 "lr": [1e-3, 1e-4, 1e-5],
+                "batch_size": [32, 64, 128],
             })
         elif args.model == "RNN":
             forecaster.tune({
-                "input_chunk_length": [60, 180, 360, 540],
-                "hidden_dim": [16, 32, 64, 126],
+                "input_chunk_length": [180, 360, 540],
+                "hidden_dim": [32, 64, 126],
                 "model": ["RNN", "GRU", "LSTM"],
                 "n_rnn_layers": [2, 3, 4, 5],
                 "add_encoders": ["future"],
+                "batch_size": [32, 64, 128],
                 "lr": [1e-3, 1e-4, 1e-5],
             })
         elif args.model == "Transformer":
             forecaster.tune({
-                "input_chunk_length": [60, 180, 360, 540],
+                "input_chunk_length": [180, 360, 540],
                 "nhead": [1],
                 "num_encoder_layers": [2, 3, 4],
                 "num_decoder_layers": [2, 3, 4],
-                "add_encoders": ["past"],
+                "add_encoders": ["past", "none"],
                 "lr": [1e-3, 1e-4, 1e-5],
+                "batch_size": [32, 64, 128],
             })
         elif args.model == "NLinear":
             forecaster.tune({
-                "input_chunk_length": [60, 180, 360, 540],
+                "input_chunk_length": [180, 360, 540],
                 "const_init": [True, False],
-                "batch_size": [16, 32, 64, 128],
-                "add_encoders": ["past_and_future"],
+                "batch_size": [32, 64, 128],
+                "add_encoders": ["past_and_future", "none"],
                 "lr": [1e-3, 1e-4, 1e-5],
             })
         elif args.model == "DLinear":
             forecaster.tune({
-                "input_chunk_length": [60, 180, 360, 540],
+                "input_chunk_length": [180, 360, 540],
                 "kernel_size": [2, 25, 51, 101],
                 "const_init": [True, False],
-                "batch_size": [16, 32, 64, 128],
-                "add_encoders": ["past_and_future"],
+                "batch_size": [32, 64, 128],
+                "add_encoders": ["past_and_future", "none"],
                 "lr": [1e-3, 1e-4, 1e-5],
             })
         elif args.model == "XGB":
             forecaster.tune({
                 "lags" : [60, 180, 360, 540],
                 "lags_past_covariates" : [60, 180, 360, 540],
-                "add_encoders": ["past"],
+                "add_encoders": ["past", "none"],
             })
         elif args.model == "NBEATS":
             forecaster.tune({
-                "input_chunk_length": [60, 180, 360, 540],
+                "input_chunk_length": [180, 360, 540],
                 "generic_architecture": [True, False],
                 "num_stacks": [1, 2, 3, 4],
                 "num_layers": [1, 2, 4, 8],
-                "add_encoders": ["past"],
+                "add_encoders": ["past", "none"],
                 "lr": [1e-3, 1e-4, 1e-5],
+                "batch_size": [32, 64, 128],
             })
         elif args.model == "Linear":
             forecaster.tune({
                 "lags" : [60, 180, 360, 540],
                 "lags_past_covariates" : [60, 180, 360, 540],
-                "add_encoders": ["past"],
+                "add_encoders": ["past", "none"],
             })
         elif args.model == "TFT":
             forecaster.tune({
-                "input_chunk_length": [60, 180, 360, 540],
-                "hidden_size": [16, 64, 128, 256],
+                "input_chunk_length": [180, 360, 540],
+                "hidden_size": [64, 128, 256],
                 "full_attention": [True, False],
                 "lstm_layers": [1, 2, 3, 4],
                 "add_encoders": ["past_and_future"],
                 "lr": [1e-3, 1e-4, 1e-5],
+                "batch_size": [32, 64, 128],
             })
     
     # Adding hyperparameters to a yaml file to use later
@@ -211,7 +217,25 @@ if __name__ == "__main__":
                                  "model_likelihood": hyperparams_dict["model_likelihood"]}
             
             yaml.dump(tuned_hyperparams, file, default_flow_style=False)
+    if not args.test:
+        forecaster.output_csv_name = None
             
     forecaster.make_forecasts()
+
+    # For organizational purposes, saving information about the model
+    # in a log directory where forecast csv is outputtred
+    if args.test:
+        log_directory = f"forecasts/{args.site}/{args.target}/logs/"
+        if not os.path.exists(log_directory):
+            os.makedirs(log_directory)
+
+        csv_title = forecaster.output_csv_name.split("/")[-1].split(".")[0]
+        log_file_name = log_directory + csv_title
+
+        with open(f"{log_file_name}.yaml", 'w') as file:
+            hyperparams = {"model_hyperparameters": forecaster.hyperparams, 
+                           "model_likelihood": forecaster.model_likelihood,
+                           "epochs": args.epochs}
+            yaml.dump(hyperparams, file, default_flow_style=False)
     
     print(f"Runtime for {args.model} on {args.target} at {args.site}: {(time.time() - start)/60:.2f} minutes")
