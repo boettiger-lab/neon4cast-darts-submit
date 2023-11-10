@@ -158,13 +158,61 @@ class HistoricalForecaster():
         self.residuals = TimeSeries.from_times_and_values(self.training_set.time_index, 
                                                           residual_list)  
         
+def month_doy_range(year, month):
+    # Get the first day of the month
+    first_day = datetime(year, month, 1)
+
+    # Calculate the last day of the month
+    if month == 12:
+        last_day = datetime(year + 1, 1, 1) - timedelta(days=1)
+    else:
+        last_day = datetime(year, month + 1, 1) - timedelta(days=1)
+
+    # Calculate the day of year for the first and last day
+    doy_first_day = first_day.timetuple().tm_yday
+    doy_last_day = last_day.timetuple().tm_yday
+
+    return doy_first_day, doy_last_day
+
+def season_doy_range(year, month, day):
+    # Given date
+    given_date = datetime(year, month, day)
+
+    # Define the start and end dates for each season
+    spring_start = datetime(year, 3, 1)
+    summer_start = datetime(year, 6, 1)
+    fall_start = datetime(year, 9, 1)
+    winter_start = datetime(year, 12, 1)
+
+    # Determine the season based on the given date
+    if given_date < spring_start or given_date >= datetime(year + 1, 3, 1):
+        season = "winter"
+        start_date = winter_start
+        end_date = datetime(year + 1, 2, 28)  # Assuming non-leap year
+    elif given_date < summer_start:
+        season = "spring"
+        start_date = spring_start
+        end_date = summer_start - timedelta(days=1)
+    elif given_date < fall_start:
+        season = "summer"
+        start_date = summer_start
+        end_date = fall_start - timedelta(days=1)
+    elif given_date < winter_start:
+        season = "fall"
+        start_date = fall_start
+        end_date = winter_start - timedelta(days=1)
+
+    # Calculate the DOY range for the determined season
+    doy_start = start_date.timetuple().tm_yday
+    doy_end = end_date.timetuple().tm_yday
+
+    return doy_start, doy_end
 
 class TimeSeriesPreprocessor():
     def __init__(self,
                  input_csv_name = "targets.csv.gz",
                  load_dir_name: Optional[str] = "preprocessed_timeseries/",
                  datetime_column_name: Optional[str] = "datetime",
-                 covariates_names: Optional[list] = None,
                  validation_split_date: Optional[str] = "2023-03-09",
                  filter_kw_args: Optional[dict] = {"alpha_0": 0.001,
                                                    "n_restarts_0": 100,
@@ -206,7 +254,7 @@ class TimeSeriesPreprocessor():
     
         # If there is a gap over 7 indices, use big gap filter
         gap_series = self.var_tseries_dict[var].gaps()
-        stitched_df = filtered.pd_dataframe()
+        stitched_df = filtered.pd_dataframe(suppress_warnings=True)
 
         # For these big gaps, I replace with samples centered on historical mean and std
         for index, row in gap_series.iterrows():
@@ -216,14 +264,50 @@ class TimeSeriesPreprocessor():
                     # and avoiding leap year errors
                     try:
                         mean, std = self.doy_dict[var].loc[min(date.dayofyear, 365)]
+                        # If there is an issue, use the median daily historical data
+                        # over that month
                         if np.isnan(mean):
-                            mean = self.doy_dict[var]['mean'].median()
+                            month_range = month_doy_range(date.year, date.month)
+                            mean = (
+                                self.doy_dict[var]
+                                .loc[month_range[0]:month_range[1]]['mean']
+                                .median()
+                            )
+                            if np.isnan(mean):
+                                # And if this is still NaN, aggregate over the season
+                                season_range = season_doy_range(
+                                    date.year, date.month, date.day
+                                )
+                                mean = (
+                                    self.doy_dict[var]
+                                    .loc[season_range[0]:season_range[1]]['mean']
+                                    .median()
+                                )
                         if np.isnan(std):
-                            std = self.doy_dict[var]['std'].median()
+                            # Not exactly sure why but filtering looks way better
+                            # if I use the std over a season; this ends up not mattering
+                            # as the model only uses the median.
+                            season_range = season_doy_range(
+                                    date.year, date.month, date.day
+                            )
+                            std = (
+                                self.doy_dict[var]
+                                .loc[season_range[0]:season_range[1]]['std']
+                                .median()
+                            )
                     except:
-                        # If there is an issue, use the global mean and std
-                        mean = self.doy_dict[var]['mean'].median()
-                        std = self.doy_dict[var]['std'].median()
+                        # If there is an issue, use the monthly mean and std
+                        month_range = doy_range(date.year, date.month)
+                        mean = (
+                            self.doy_dict[var]
+                            .loc[month_range[0]:month_range[1]]['mean']
+                            .median()
+                        )
+                        std = (
+                            self.doy_dict[var]
+                            .loc[month_range[0]:month_range[1]]['std']
+                            .median()
+                        )
                     stitched_df.loc[date] = np.random.normal(mean, std, size=(500,))
         
         stitched_series = TimeSeries.from_times_and_values(
@@ -240,6 +324,7 @@ class TimeSeriesPreprocessor():
         Performs gap filling and processing of data into format that
         Darts models will accept
         """
+        self.sites_dict_null = {}
         # Preparing a dataframe
         site_df = self.df.loc[self.df.site_id == site]
         times = pd.to_datetime(site_df[self.datetime_column_name])
@@ -307,7 +392,7 @@ class TimeSeriesPreprocessor():
         # Saving each TimeSeries
         for site in self.sites_dict.keys():
             for variable in self.sites_dict[site]:
-                self.sites_dict[site][variable].pd_dataframe()\
+                self.sites_dict[site][variable].pd_dataframe(suppress_warnings=True)\
                     .to_csv(f"{self.load_dir_name}{site}-{variable}.csv")
 
     def load(self, site):
@@ -353,7 +438,8 @@ class TimeSeriesPreprocessor():
 class BaseForecaster():
     def __init__(self,
                  model: Optional[str] = None,
-                 data_preprocessor: Optional = None,
+                 train_preprocessor: Optional = None,
+                 validate_preprocessor: Optional = None,
                  target_variable: Optional[str] = None,
                  datetime_column_name: Optional[str] = "datetime",
                  covariates_names: Optional[list] = None,
@@ -380,7 +466,7 @@ class BaseForecaster():
                        "NBEATS": NBEATSModel,
                        "Linear": LinearRegressionModel,
                        "TFT": TFTModel}[model]
-        self.data_preprocessor = data_preprocessor
+        self.validate_preprocessor = validate_preprocessor
         self.target_variable = target_variable
         self.datetime_column_name = datetime_column_name
         self.covariates_names = covariates_names
@@ -404,37 +490,69 @@ class BaseForecaster():
         self.model_likelihood = model_likelihood
         # Try to get validation set from targets and not preprocessor
 
-        self._preprocess_data()
+        self.training_set, self.covs_train = self._preprocess_data(train_preprocessor)
+        self.inputs, self.covariates = self._preprocess_data(validate_preprocessor,
+                                                             train_set=False)
         
-    def _preprocess_data(self):
+    def _preprocess_data(self, data_preprocessor, train_set=True):
         """
         Performs gap filling and processing of data into format that
         Darts models will accept
         """
-        stitched_series_dict = self.data_preprocessor.sites_dict[self.site_id]
+        stitched_series_dict = data_preprocessor.sites_dict[self.site_id]
 
-        # If there was failure when doing the GP fit then we can't do preprocessing
+        # If there was failure when filtering then we can't do preprocessing
         if self.target_variable in \
-                self.data_preprocessor.site_missing_variables:
+                data_preprocessor.site_missing_variables:
             return "Cannot fit this target time series as no GP fit was performed."
-        self.inputs = stitched_series_dict[self.target_variable]
+        inputs = stitched_series_dict[self.target_variable]
 
         if self.covariates_names is not None:
             # And not using the covariates that did not yield GP fits beforehand
-            for null_variable in self.data_preprocessor.site_missing_variables:
+            for null_variable in data_preprocessor.site_missing_variables:
                 self.covariates_names.remove(null_variable)
     
             # Initializing covariates list then concatenating in for loop
-            self.covariates = stitched_series_dict[self.covariates_names[0]]
+            covariates = stitched_series_dict[self.covariates_names[0]]
             for cov_var in self.covariates_names[1:]:
-                self.covariates = self.covariates.concatenate(stitched_series_dict[cov_var], 
+                covariates = covariates.concatenate(stitched_series_dict[cov_var], 
                                                               axis=1, 
                                                               ignore_time_axis=True)
-            self.covariates = self.covariates.median()
+            covariates = covariates.median()
             
         # Taking the median now to accomodate using doy covariates
-        self.training_set = self.inputs.median()
+        training_set, validation_set = (
+            inputs
+            .median()
+            .split_after(self.split_date)
+        )
+        covs_train, _ = (
+            covariates
+            .median()
+            .split_after(self.split_date)
+        )
 
+        if train_set:
+            return training_set, covs_train
+        else:
+            return inputs.median(), covariates.median()
+            
+    def get_validation_set(self, scaler):
+        # I want to split up the validation set according to the forecast horizon
+        interval = pd.Timedelta(days=self.forecast_horizon)
+        dates = pd.date_range(self.split_date + interval, periods=11, freq=interval)
+        val_set_list = []
+        for date in dates:
+            val_set_list.append(
+                scaler.transform(
+                    self.inputs.slice_n_points_before(
+                        date, 
+                        self.forecast_horizon + self.hyperparams["input_chunk_length"] + 1
+                    )
+                )
+            )
+        return val_set_list 
+        
     def tune(self,
              hyperparameter_dict: Optional[dict]
             ):
@@ -442,10 +560,6 @@ class BaseForecaster():
         Sets up Optuna trial to perform hyperparameter tuning
         Input dictionary will be of the form {"hyperparamter": [values to be tested]}
         """
-        self.validation_set = self.get_validation_set()
-        if len(self.validation_set) != self.forecast_horizon:
-            raise Exception(f"There is missing data in the specified forecast window at {self.site_id}. " + \
-                            "This site will not be used for evaluating hyperparameters.")
         # Setting up an optuna Trial
         def objective(trial):
             callback = [PyTorchLightningPruningCallback(trial, monitor="val_loss")]
@@ -465,14 +579,21 @@ class BaseForecaster():
             predict_kws = {"n": self.forecast_horizon,
                            "num_samples": self.num_samples}
             self.scaler = Scaler()
+            self.scaler_cov = Scaler()
             # Need to treat transformation differently if models use covariates or not
             if self.covariates is not None:
-                training_set, covariates = self.scaler.fit_transform([self.training_set.median(),
-                                                                      self.covariates.median()])
+                training_set = self.scaler.fit_transform(self.training_set)
+                covariates = self.scaler_cov.fit_transform(self.covs_train)
                 extras["past_covariates"] = covariates
-                predict_kws["past_covariates"] = covariates
+                extras['val_series'] = self.get_validation_set(self.scaler)
+                extras["val_past_covariates"] = [
+                    self.scaler_cov.transform(self.covariates) \
+                      for i in range(len(extras['val_series']))
+                ]
             else:
-                training_set = self.scaler.fit_transform(self.training_set.median())
+                training_set = self.scaler.fit_transform(self.training_set)
+                validation_set = self.get_validation_set(self.scaler)
+                extras["val_series"] = validation_set
 
             # Need to delete epochs which aren't used in the regression models
             if self.model_ == XGBModel or self.model_ == LinearRegressionModel:
@@ -483,9 +604,10 @@ class BaseForecaster():
              " misalignment between the training set and the specified validation" +\
              " split date. Note that the validation split date is defined to" +\
              " include the last date of the training set."
-            
+
+            import pdb; pdb.set_trace()
             model.fit(training_set, **extras)
-            
+            # Work from here!
             predictions = model.predict(**predict_kws)
             predictions = self.scaler.inverse_transform(predictions)
 
@@ -502,26 +624,6 @@ class BaseForecaster():
         
         self.hyperparams = study.best_trial.params
         self.tuned = True
-
-    def get_validation_set(self):
-        # take validation_split_date and add number of dates
-        date_range = pd.date_range(self.split_date + pd.DateOffset(days=1), 
-                                   periods=self.forecast_horizon, 
-                                   freq='D')
-        # Filter targets df for site and variable
-        site_df = self.targets_df[self.targets_df["site_id"] == self.site_id]
-        site_var_df_ = site_df[["datetime", self.target_variable]]
-        site_var_df = site_var_df_.copy()
-        site_var_df["datetime"] = pd.to_datetime(site_var_df_["datetime"])
-        validation_df = pd.DataFrame()
-        # Now creating a new dataframe of observed series from the forecast
-        # window
-        for date in date_range:
-            entry = site_var_df[site_var_df.datetime == date]
-            validation_df = pd.concat([validation_df, entry], 
-                                      axis=0).reset_index(drop=True)
-        
-        return validation_df[self.target_variable]
         
     def make_forecasts(self):
         """
@@ -573,7 +675,7 @@ class BaseForecaster():
         predictions = self.model.predict(**predict_kws)
         predictions = self.scaler.inverse_transform(predictions)
 
-        predictions.pd_dataframe().to_csv(self.output_csv_name)
+        predictions.pd_dataframe(suppress_warnings=True).to_csv(self.output_csv_name)
 
     def get_historicals_and_residuals(self):
         """
@@ -777,5 +879,5 @@ class ResidualForecaster():
                                   num_samples=self.num_samples)
         self.predictions = self.scaler.inverse_transform(predictions)
 
-        self.predictions.pd_dataframe().to_csv(self.output_csv_name)
+        self.predictions.pd_dataframe(suppress_warnings=True).to_csv(self.output_csv_name)
 
