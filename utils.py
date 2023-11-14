@@ -2,7 +2,6 @@ from darts import TimeSeries
 from typing import Optional
 import pandas as pd
 import matplotlib.pyplot as plt
-from optuna.integration import PyTorchLightningPruningCallback
 import pandas as pd
 from darts.models import GaussianProcessFilter
 from darts import TimeSeries
@@ -31,24 +30,31 @@ import pdb
 import argparse
 import copy
 import numpy as np
+from torchmetrics import SymmetricMeanAbsolutePercentageError
+from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
-def crps(forecast, observed):
+def crps(forecast, observed, observed_is_ts=False):
     """
-    Returns an array of CRPS scores 
+    Returns an array of CRPS scores; assumes forecast 
     """
     forecast_array = forecast.pd_dataframe(suppress_warnings=True).values
-
+    if observed_is_ts:
+        observed = observed.pd_dataframe(suppress_warnings=True).values.reshape((-1,))
     crps_scores = []
     for i in range(len(forecast_array)):
         # Note forecastscore is CRPS.CRPS
         crps, _, __ = forecastscore(forecast_array[i], observed[i]).compute()
         crps_scores.append(crps)
 
-    crps_scores = TimeSeries.from_times_and_values(forecast.time_index, 
-                                     crps_scores, 
-                                     fill_missing_dates=True, freq="D")
+    crps_scores = TimeSeries.from_times_and_values(
+        forecast.time_index, 
+        crps_scores, 
+        fill_missing_dates=True, 
+        freq="D"
+    )
+    
     return crps_scores
 
 
@@ -135,7 +141,10 @@ class HistoricalForecaster():
     
             # Putting together the forecast timeseries
             self.forecast_df = forecast_df
-            self.forecast_ts = TimeSeries.from_times_and_values(forecast_df.index, samples)
+            self.forecast_ts = TimeSeries.from_times_and_values(
+                forecast_df.index, 
+                samples
+            )
             
         else:
             self.forecast_df = None
@@ -145,7 +154,7 @@ class HistoricalForecaster():
     def get_residuals(self):
         # This needs to be re-examined!!!
         residual_list = []
-        # Going through each date and finding the difference between the doy historical mean and
+        # Finding the difference between the doy historical mean and
         # the observed value
         for date in self.training_set.time_index:
             doy = date.dayofyear
@@ -162,13 +171,13 @@ def month_doy_range(year, month):
     # Get the first day of the month
     first_day = datetime(year, month, 1)
 
-    # Calculate the last day of the month
+    # Calculating the last day of the month
     if month == 12:
         last_day = datetime(year + 1, 1, 1) - timedelta(days=1)
     else:
         last_day = datetime(year, month + 1, 1) - timedelta(days=1)
 
-    # Calculate the day of year for the first and last day
+    # Finding the day of year for the first and last day
     doy_first_day = first_day.timetuple().tm_yday
     doy_last_day = last_day.timetuple().tm_yday
 
@@ -178,7 +187,7 @@ def season_doy_range(year, month, day):
     # Given date
     given_date = datetime(year, month, day)
 
-    # Define the start and end dates for each season
+    # Arbitrarily definine the start and end dates for each season
     spring_start = datetime(year, 3, 1)
     summer_start = datetime(year, 6, 1)
     fall_start = datetime(year, 9, 1)
@@ -537,8 +546,9 @@ class BaseForecaster():
         else:
             return inputs.median(), covariates.median()
             
-    def get_validation_set(self, scaler):
-        # I want to split up the validation set according to the forecast horizon
+    def get_validation_set(self, scaler, input_chunk_length):
+        # This function creates a sliding window across some preprocessed data
+        # so we can see how the model performs at different times of the year
         interval = pd.Timedelta(days=self.forecast_horizon)
         dates = pd.date_range(self.split_date + interval, periods=11, freq=interval)
         val_set_list = []
@@ -547,11 +557,47 @@ class BaseForecaster():
                 scaler.transform(
                     self.inputs.slice_n_points_before(
                         date, 
-                        self.forecast_horizon + self.hyperparams["input_chunk_length"] + 1
+                        self.forecast_horizon + input_chunk_length
                     )
                 )
             )
-        return val_set_list 
+        return val_set_list
+
+    def get_predict_set(self, scaler, input_chunk_length):
+        # Similar to get_validation_set, except here I want to create 
+        # a window that just has the data to use as an input, nothing to validate
+        # a prediction
+        interval = pd.Timedelta(days=self.forecast_horizon)
+        dates = pd.date_range(self.split_date, periods=11, freq=interval)
+        predict_set_list = []
+        for date in dates:
+            predict_set_list.append(
+                scaler.transform(
+                    self.inputs.slice_n_points_before(
+                        date, 
+                        input_chunk_length
+                    )
+                )
+            )
+        return predict_set_list
+
+    def get_check_set(self, scaler, input_chunk_length):
+        # Here I am doing the complementary half of get_predict_set,
+        # which is getting a "ground truth" for the history provided
+        # by get_predict
+        interval = pd.Timedelta(days=self.forecast_horizon)
+        dates = pd.date_range(self.split_date, periods=11, freq=interval)
+        check_set_list = []
+        for date in dates:
+            check_set_list.append(
+                scaler.transform(
+                    self.inputs.slice_n_points_after(
+                        date + pd.Timedelta(1), 
+                        self.forecast_horizon
+                    )
+                )
+            )
+        return check_set_list 
         
     def tune(self,
              hyperparameter_dict: Optional[dict]
@@ -562,17 +608,33 @@ class BaseForecaster():
         """
         # Setting up an optuna Trial
         def objective(trial):
-            callback = [PyTorchLightningPruningCallback(trial, monitor="val_loss")]
+            # Selecting hyperparameters for the trial
             hyperparams = {key: trial.suggest_categorical(key, value) 
                                                for key, value in hyperparameter_dict.items()}
 
-            # Need to handle lags and time axis encoders
+            # Will stop training when validation loss does not decrease more than 0.05 (`min_delta`) over
+            # a period of 5 epochs (`patience`)
+            my_stopper = EarlyStopping(
+                monitor="val_loss",
+                patience=10,
+                min_delta=0.05,
+                mode='min',
+            )
+            pl_trainer_kwargs={"callbacks": [my_stopper]}
+            # And watching SMAPE
+            torch_metrics = SymmetricMeanAbsolutePercentageError()
+
+            # Need to format some hypers
             hyperparams = self.prepare_hyperparams(hyperparams)
 
-            model = self.model_(**hyperparams,
-                                output_chunk_length=self.forecast_horizon,
-                                **self.model_likelihood,
-                                random_state=self.seed)
+            model = self.model_(
+                **hyperparams,
+                output_chunk_length=self.forecast_horizon,
+                **self.model_likelihood,
+                random_state=self.seed,
+                pl_trainer_kwargs=pl_trainer_kwargs,
+                torch_metrics=torch_metrics
+            )
 
             extras = {"verbose": False,
                       "epochs": self.epochs}
@@ -580,19 +642,28 @@ class BaseForecaster():
                            "num_samples": self.num_samples}
             self.scaler = Scaler()
             self.scaler_cov = Scaler()
-            # Need to treat transformation differently if models use covariates or not
+            # Some models don't use past covariates, so the inputs
+            # for these classes of models need to be handled differently
             if self.covariates is not None:
                 training_set = self.scaler.fit_transform(self.training_set)
                 covariates = self.scaler_cov.fit_transform(self.covs_train)
                 extras["past_covariates"] = covariates
-                extras['val_series'] = self.get_validation_set(self.scaler)
+                # Handling training and validation series + covariates differently
+                # because they were preprocessed separately
+                extras['val_series'] = self.get_validation_set(
+                    self.scaler,
+                    hyperparams['input_chunk_length']
+                )
                 extras["val_past_covariates"] = [
                     self.scaler_cov.transform(self.covariates) \
                       for i in range(len(extras['val_series']))
                 ]
             else:
                 training_set = self.scaler.fit_transform(self.training_set)
-                validation_set = self.get_validation_set(self.scaler)
+                validation_set = self.get_validation_set(
+                    self.scaler,
+                    hyperparams['input_chunk_length']
+                )
                 extras["val_series"] = validation_set
 
             # Need to delete epochs which aren't used in the regression models
@@ -605,17 +676,50 @@ class BaseForecaster():
              " split date. Note that the validation split date is defined to" +\
              " include the last date of the training set."
 
-            import pdb; pdb.set_trace()
             model.fit(training_set, **extras)
-            # Work from here!
-            predictions = model.predict(**predict_kws)
-            predictions = self.scaler.inverse_transform(predictions)
 
-            crps_ = crps(predictions, 
-                         self.validation_set,
-                        )
+            # Preparing the series and covariates to input to the predict call
+            predict_series = self.get_predict_set(
+                self.scaler,
+                hyperparams['input_chunk_length']
+            )
             
-            crps_mean = crps_.mean(axis=0).values()[0][0]
+            predict_kws = {'num_samples': 500}
+            if self.covariates is not None:
+                predict_kws['past_covariates'] = extras['val_past_covariates']
+
+            predictions = model.predict(
+                n=self.forecast_horizon, 
+                series=predict_series, 
+                **predict_kws
+            )
+            
+            check_predictions = self.get_check_set(
+                self.scaler,
+                hyperparams['input_chunk_length']
+            )
+
+            # Making sure that predictions and their solutions align in dates
+            assert (
+                predictions[0].time_index[0] == check_predictions[0].time_index[0]
+            ), "Error with date alignment on tuning check"
+
+            # Computing CRPS for each prediction window from the validation set
+            # and taking the mean of these values.
+            crps_list = []
+            for i in range(len(predictions)):
+                crps_list.append(
+                    crps(
+                        predictions[i],
+                        check_predictions[i],
+                        observed_is_ts=True
+                    ).pd_dataframe(suppress_warnings=True).values
+                ) 
+            crps_mean = np.array(crps_list).mean()
+
+            # Tuning will provide the score with the lowest mean CRPS over
+            # the validation set which includes 11 evenly-spaced windows
+            # over the year
             return crps_mean if crps_mean != np.nan else float("inf")
 
         study = optuna.create_study(direction="minimize")
@@ -630,30 +734,44 @@ class BaseForecaster():
         This function fits a Darts model to the training_set
         """
         print(self.hyperparams, self.model_likelihood)
+
+        # Stopping early
+        my_stopper = EarlyStopping(
+                monitor="val_loss",
+                patience=10,
+                min_delta=0.05,
+                mode='min',
+        )
+        pl_trainer_kwargs={"callbacks": [my_stopper]}
+        # And watching SMAPE
+        torch_metrics = SymmetricMeanAbsolutePercentageError()
         
         # Need to handle lags and time axis encoders
         self.hyperparams = self.prepare_hyperparams(self.hyperparams)
 
-        self.model = self.model_(**self.hyperparams,
-                                 output_chunk_length=self.forecast_horizon,
-                                 **self.model_likelihood,
-                                 random_state=self.seed)
-        self.scaler = Scaler()
+        self.model = self.model_(
+            **self.hyperparams,
+            output_chunk_length=self.forecast_horizon,
+            **self.model_likelihood,
+            random_state=self.seed,
+            pl_trainer_kwargs=pl_trainer_kwargs,
+            torch_metrics=torch_metrics,
+        )
+        
         extras = {"verbose": self.verbose,
                   "epochs": self.epochs}
         predict_kws = {"n": self.forecast_horizon,
                        "num_samples": self.num_samples}
 
         # Need to account for models that don't use past covariates
+        self.scaler = Scaler()
         if self.covariates is not None:
-            # Changing to median so that I can use the time axis encoder.
-            # Darts does not allow inputs of mixed dimension.
-            training_set, covariates = self.scaler.fit_transform([self.training_set.median(),
-                                                                  self.covariates.median()])
+            self.scaler_cov = Scaler()
+            training_set = self.scaler.fit_transform(self.training_set)
+            covariates = self.scaler.fit_transform(self.covs_train)
             extras["past_covariates"] = covariates
-            predict_kws["past_covariates"] = covariates
         else:
-            training_set = self.scaler.fit_transform(self.training_set.median())
+            training_set = self.scaler.fit_transform(self.training_set)
 
         # Regression models don't accept these key word arguments for .fit()
         if self.model_ == XGBModel or self.model_ == LinearRegressionModel:
@@ -665,10 +783,11 @@ class BaseForecaster():
          " date. Note that the validation split date is defined to include the last" +\
          " date of the training set."
         
-        self.model.fit(training_set,
-                       **extras)
+        self.model.fit(training_set, **extras)
+        # Now work to do the same as you did above in tune
 
-        # Accounting for if there is dropout
+        # Accounting for if there is dropout; Might delete this as this wasn't an interesting
+        # excursion
         if "dropout" in list(self.model_likelihood.keys()):
             predict_kws["mc_dropout"] = True
             
