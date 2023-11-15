@@ -452,7 +452,7 @@ class BaseForecaster():
                  target_variable: Optional[str] = None,
                  datetime_column_name: Optional[str] = "datetime",
                  covariates_names: Optional[list] = None,
-                 output_csv_name: Optional[str] = "residual_forecaster_output.csv",
+                 output_csv_name: Optional[str] = "residual_forecaster_output",
                  validation_split_date: Optional[str] = "2023-03-09", #YYYY-MM-DD n.b. this is inclusive
                  model_hyperparameters: Optional[dict] = None,
                  model_likelihood: Optional[dict] = None,
@@ -758,20 +758,39 @@ class BaseForecaster():
             torch_metrics=torch_metrics,
         )
         
-        extras = {"verbose": self.verbose,
-                  "epochs": self.epochs}
-        predict_kws = {"n": self.forecast_horizon,
-                       "num_samples": self.num_samples}
+        extras = {
+            "verbose": self.verbose,
+            "epochs": self.epochs
+        }
+        predict_kws = {
+            "n": self.forecast_horizon,
+            "num_samples": self.num_samples
+        }
 
         # Need to account for models that don't use past covariates
         self.scaler = Scaler()
         if self.covariates is not None:
             self.scaler_cov = Scaler()
             training_set = self.scaler.fit_transform(self.training_set)
-            covariates = self.scaler.fit_transform(self.covs_train)
+            covariates = self.scaler_cov.fit_transform(self.covs_train)
             extras["past_covariates"] = covariates
+            # Handling training and validation series + covariates differently
+            # because they were preprocessed separately
+            extras['val_series'] = self.get_validation_set(
+                self.scaler,
+                self.hyperparams['input_chunk_length']
+            )
+            extras["val_past_covariates"] = [
+                self.scaler_cov.transform(self.covariates) \
+                  for i in range(len(extras['val_series']))
+            ]
         else:
             training_set = self.scaler.fit_transform(self.training_set)
+            validation_set = self.get_validation_set(
+                self.scaler,
+                hyperparams['input_chunk_length']
+            )
+            extras["val_series"] = validation_set
 
         # Regression models don't accept these key word arguments for .fit()
         if self.model_ == XGBModel or self.model_ == LinearRegressionModel:
@@ -784,17 +803,34 @@ class BaseForecaster():
          " date of the training set."
         
         self.model.fit(training_set, **extras)
-        # Now work to do the same as you did above in tune
+
+        # Preparing input series and covariates for the predictions
+        predict_series = self.get_predict_set(
+                self.scaler,
+                self.hyperparams['input_chunk_length']
+        )
+        if self.covariates is not None:
+            predict_kws['past_covariates'] = [
+                    self.scaler_cov.transform(self.covariates) \
+                      for i in range(len(predict_series))
+            ]
 
         # Accounting for if there is dropout; Might delete this as this wasn't an interesting
         # excursion
         if "dropout" in list(self.model_likelihood.keys()):
             predict_kws["mc_dropout"] = True
             
-        predictions = self.model.predict(**predict_kws)
-        predictions = self.scaler.inverse_transform(predictions)
+        predictions = self.model.predict( 
+            series=predict_series, 
+            **predict_kws
+        )
+        for prediction in predictions:
+            prediction = self.scaler.inverse_transform(prediction)
+            csv_name = self.output_csv_name + "_" + \
+                           prediction.time_index[0].strftime('%Y_%m_%d')
+            prediction.pd_dataframe(suppress_warnings=True).to_csv(csv_name)
+            
 
-        predictions.pd_dataframe(suppress_warnings=True).to_csv(self.output_csv_name)
 
     def get_historicals_and_residuals(self):
         """
@@ -802,11 +838,12 @@ class BaseForecaster():
         """
         # This presumes that the scaler will not have been modified in interim 
         # from calling `make_forecasts`
-        historical_forecast_kws = {"num_samples": self.num_samples,
-                                   "forecast_horizon": self.forecast_horizon,
-                                   "retrain": False,
-                                   "last_points_only": False,
-                                  }
+        historical_forecast_kws = {
+            "num_samples": self.num_samples,
+            "forecast_horizon": self.forecast_horizon,
+            "retrain": False,
+            "last_points_only": False,
+        }
         if self.covariates is not None:
             training_set, covariates = self.scaler.transform([self.training_set,
                                                               self.covariates])
@@ -823,16 +860,19 @@ class BaseForecaster():
                                                 historical_forecast in historical_forecasts]
         # Getting the target time series slice for the historical forecast
         self.historical_ground_truth = self.training_set.slice(
-                                            historical_forecasts[0].time_index[0], 
-                                            historical_forecasts[-1].time_index[-1])
+            historical_forecasts[0].time_index[0], 
+            historical_forecasts[-1].time_index[-1]
+        )
 
         # Now concatenating the historical forecasts which were returned
         # as a list above
         self.historical_forecasts = historical_forecasts[0]
         for time_series in historical_forecasts[1:]:
-            self.historical_forecasts = self.historical_forecasts.concatenate(time_series, 
-                                                                axis=0, 
-                                                                ignore_time_axis=True)
+            self.historical_forecasts = self.historical_forecasts.concatenate(
+                time_series, 
+                axis=0, 
+                ignore_time_axis=True
+            )
 
 
         # Defining residual as difference between the median and ground truth
