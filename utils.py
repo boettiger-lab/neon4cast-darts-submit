@@ -32,6 +32,7 @@ import copy
 import numpy as np
 from torchmetrics import SymmetricMeanAbsolutePercentageError
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
+import warnings
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
@@ -264,6 +265,11 @@ class TimeSeriesPreprocessor():
         # If there is a gap over 7 indices, use big gap filter
         gap_series = self.var_tseries_dict[var].gaps()
         stitched_df = filtered.pd_dataframe(suppress_warnings=True)
+        
+        # Ignoring runtime warnings in this function only
+        # This is because I allow means to be found of empty arrays,
+        # yielding NaNs, which is certainly not elegant
+        warnings.filterwarnings("ignore", category=RuntimeWarning)
 
         # For these big gaps, I replace with samples centered on historical mean and std
         for index, row in gap_series.iterrows():
@@ -304,27 +310,30 @@ class TimeSeriesPreprocessor():
                                 .loc[season_range[0]:season_range[1]]['std']
                                 .median()
                             )
+                        if np.isnan(std) or np.isnan(mean):
+                            raise ValueError
                     except:
-                        # If there is an issue, use the monthly mean and std
-                        month_range = doy_range(date.year, date.month)
-                        mean = (
-                            self.doy_dict[var]
-                            .loc[month_range[0]:month_range[1]]['mean']
-                            .median()
-                        )
-                        std = (
-                            self.doy_dict[var]
-                            .loc[month_range[0]:month_range[1]]['std']
-                            .median()
-                        )
+                        # If above conditions fail use the previous date's samples, and
+                        # if there is an issue with accessing a previous date, 
+                        # use global
+                       try:
+                           mean = stitched_df.loc[previous_date].median()
+                           std = stitched_df.loc[previous_date].std()
+                       except:
+                           mean = self.doy_dict[var]['mean'].median()
+                           std = self.doy_dict[var]['std'].max()
+
                     stitched_df.loc[date] = np.random.normal(mean, std, size=(500,))
+                    previous_date = date
         
         stitched_series = TimeSeries.from_times_and_values(
-                                    stitched_df.index, 
-                                    stitched_df.values.reshape(
-                                                len(stitched_df), 
-                                                1, 
-                                                -1))
+                              stitched_df.index, 
+                              stitched_df.values.reshape(
+                                  len(stitched_df), 
+                                  1, 
+                                  -1,
+                              )
+        )
         
         return stitched_series
 
@@ -452,7 +461,7 @@ class BaseForecaster():
                  target_variable: Optional[str] = None,
                  datetime_column_name: Optional[str] = "datetime",
                  covariates_names: Optional[list] = None,
-                 output_csv_name: Optional[str] = "residual_forecaster_output",
+                 output_csv_name: Optional[str] = "default",
                  validation_split_date: Optional[str] = "2023-03-09", #YYYY-MM-DD n.b. this is inclusive
                  model_hyperparameters: Optional[dict] = None,
                  model_likelihood: Optional[dict] = None,
@@ -519,7 +528,8 @@ class BaseForecaster():
         if self.covariates_names is not None:
             # And not using the covariates that did not yield GP fits beforehand
             for null_variable in data_preprocessor.site_missing_variables:
-                self.covariates_names.remove(null_variable)
+                if null_variable in self.covariates_names:
+                    self.covariates_names.remove(null_variable)
     
             # Initializing covariates list then concatenating in for loop
             covariates = stitched_series_dict[self.covariates_names[0]]
@@ -550,7 +560,7 @@ class BaseForecaster():
         # This function creates a sliding window across some preprocessed data
         # so we can see how the model performs at different times of the year
         interval = pd.Timedelta(days=self.forecast_horizon)
-        dates = pd.date_range(self.split_date + interval, periods=11, freq=interval)
+        dates = pd.date_range(self.split_date + interval, periods=12, freq=interval)
         val_set_list = []
         for date in dates:
             val_set_list.append(
@@ -568,7 +578,7 @@ class BaseForecaster():
         # a window that just has the data to use as an input, nothing to validate
         # a prediction
         interval = pd.Timedelta(days=self.forecast_horizon)
-        dates = pd.date_range(self.split_date, periods=11, freq=interval)
+        dates = pd.date_range(self.split_date, periods=12, freq=interval)
         predict_set_list = []
         for date in dates:
             predict_set_list.append(
@@ -586,7 +596,7 @@ class BaseForecaster():
         # which is getting a "ground truth" for the history provided
         # by get_predict
         interval = pd.Timedelta(days=self.forecast_horizon)
-        dates = pd.date_range(self.split_date, periods=11, freq=interval)
+        dates = pd.date_range(self.split_date, periods=12, freq=interval)
         check_set_list = []
         for date in dates:
             check_set_list.append(
@@ -739,7 +749,7 @@ class BaseForecaster():
         my_stopper = EarlyStopping(
                 monitor="val_loss",
                 patience=10,
-                min_delta=0.05,
+                min_delta=0.02,
                 mode='min',
         )
         pl_trainer_kwargs={"callbacks": [my_stopper]}
@@ -819,7 +829,7 @@ class BaseForecaster():
         # excursion
         if "dropout" in list(self.model_likelihood.keys()):
             predict_kws["mc_dropout"] = True
-            
+        import pdb; pdb.set_trace()
         predictions = self.model.predict( 
             series=predict_series, 
             **predict_kws
@@ -827,7 +837,7 @@ class BaseForecaster():
         for prediction in predictions:
             prediction = self.scaler.inverse_transform(prediction)
             csv_name = self.output_csv_name + "_" + \
-                           prediction.time_index[0].strftime('%Y_%m_%d')
+                           prediction.time_index[0].strftime('%Y_%m_%d.csv')
             prediction.pd_dataframe(suppress_warnings=True).to_csv(csv_name)
             
 

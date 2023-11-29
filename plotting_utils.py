@@ -462,6 +462,7 @@ def plot_crps_bysite(model, targets_df, target_variable, suffix="", plot_name=No
     ax.spines["left"].set_visible(True)
     ax.spines["bottom"].set_visible(True)
     plt.xticks(rotation=30)
+    plt.title(f'{target_variable}')
     
     # Saving the plot if desired
     if plot_name != None:
@@ -495,9 +496,10 @@ def plot_score_improvement_bysite(model, targets_df, target_variable, suffix="",
 
     rmse_df = create_rmse_df_from_dict(score_dict)
     crps_df = pd.DataFrame([(site_id, data_dict['crps_forecast'][i], data_dict['crps_historical'][i]) \
-                                 for site_id, data_dict in score_dict.items() \
-                                 for i in range(len(data_dict['crps_forecast']))],
-                            columns=["site_id", 'forecast', 'historical'])
+        for site_id, data_dict in score_dict.items() \
+        for i in range(len(data_dict['crps_forecast']))],
+        columns=["site_id", 'forecast', 'historical']
+    )
     crps_df = pd.melt(crps_df, id_vars=["site_id"], var_name="model_type", value_name="crps")
     crps_means = crps_df.groupby(["site_id", "model_type"])['crps'].mean().reset_index()
     model_crps_scores = crps_means[crps_means['model_type'] == "forecast"]
@@ -560,6 +562,86 @@ def plot_score_improvement_bysite(model, targets_df, target_variable, suffix="",
             os.makedirs(f"plots/{site_id}/{target_variable}/")
         plt.savefig(f"plots/{site_id}/{target_variable}/{plot_name}")
 
-def plot_sitewide_comparison(model, target_df, suffix):
+def plot_sitewide_comparison(model, target_df, suffix, plot_type='percentage_improvement'):
+    plot_function = {
+        'strip': plot_crps_bysite, 
+        'percentage_improvement': plot_score_improvement_bysite,
+    }[plot_type]
     for target_variable in ['oxygen', 'temperature', 'chla']:
-        plot_score_improvement_bysite(model, target_df, target_variable, suffix=suffix)
+        plot_function(model, target_df, target_variable, suffix)
+
+def count_score_improvement_bysite(model, targets_df, target_variable, suffix="", count_dict={}):
+    score_dict = {}
+    
+    for site_id in targets_df.site_id.unique():
+        score_dict = modify_score_dict(
+            model, 
+            targets_df, 
+            target_variable, 
+            site_id, 
+            suffix, 
+            score_dict
+        )
+        score_dict = modify_score_dict(
+            model, 
+            targets_df, 
+            target_variable, 
+            site_id, 
+            suffix, 
+            score_dict,
+            score_rmse=True
+        )
+
+    rmse_df = create_rmse_df_from_dict(score_dict)
+    crps_df = pd.DataFrame([(site_id, data_dict['crps_forecast'][i], data_dict['crps_historical'][i]) \
+        for site_id, data_dict in score_dict.items() \
+        for i in range(len(data_dict['crps_forecast']))],
+        columns=["site_id", 'forecast', 'historical']
+    )
+    crps_df = pd.melt(crps_df, id_vars=["site_id"], var_name="model_type", value_name="crps")
+    crps_means = crps_df.groupby(["site_id", "model_type"])['crps'].mean().reset_index()
+    model_crps_scores = crps_means[crps_means['model_type'] == "forecast"]
+    historical_crps_scores = crps_means[crps_means['model_type'] == "historical"]
+    merged_df =  model_crps_scores.merge(
+        historical_crps_scores, 
+        on='site_id', 
+        suffixes=('_forecast', '_historical'),
+    )
+    merged_df = merged_df.merge(rmse_df, on="site_id")
+    merged_df.drop(
+        ['model_type_forecast', 'model_type_historical'], 
+        axis=1, 
+        inplace=True
+    )
+    melted_df = pd.melt(
+        merged_df, 
+        id_vars=['site_id'], 
+        var_name='crps/rmse', 
+        value_name='value'
+    )
+    melted_df[['score_type', 'model_type']] = melted_df['crps/rmse'].str.split(
+        '_', 
+        expand=True
+    )
+    pivoted_df = melted_df.pivot(
+        index='site_id', 
+        columns=['score_type', 'model_type'], 
+        values='value')
+    pivoted_df.reset_index(inplace=True)
+    custom_palette = {True: 'tab:blue', False: 'indianred'}
+    marker_key = {'crps': 'D', 'rmse': '*'}
+    for metric in ['crps', 'rmse']:
+        pivoted_df[f"{metric}_percent_improvement"] = (
+            (pivoted_df[metric]['historical'] - pivoted_df[metric]['forecast']) /
+            pivoted_df[metric]['historical']
+        ) * 100
+        pivoted_df[f"{metric}_positive"] = pivoted_df[f"{metric}_percent_improvement"] > 0
+        
+    pivoted_df['combined_improvement'] = pivoted_df['crps_positive'] & pivoted_df['rmse_positive']
+    model_name = model + suffix
+    if model_name not in count_dict.keys():
+        count_dict[model_name] = {}
+    count_dict[model_name][target_variable] = f"{pivoted_df['combined_improvement'].sum()}" +\
+        f"/{len(pivoted_df['combined_improvement'])}"
+
+    return count_dict
