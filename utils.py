@@ -117,9 +117,11 @@ class HistoricalForecaster():
         the forecast
         """
         # Getting the doys for the forecast window
-        forecast_doys = pd.date_range(start=self.validation_split_date, 
-                                      periods=self.forecast_horizon, 
-                                      freq='D').dayofyear
+        forecast_doys = pd.date_range(
+            start=self.validation_split_date, 
+            periods=self.forecast_horizon, 
+            freq='D',
+        ).dayofyear
         forecast_df = self.doy_df.loc[forecast_doys]
 
 
@@ -136,15 +138,24 @@ class HistoricalForecaster():
             
         # Catching case where there is no sensor data at all for that site
         if not np.isnan(samples.mean()):
-            # Now creating an index going from doy to date
-            date_index = [day_of_year_to_date(self.year, day) for day in forecast_df.index]
+            # Now creating an index going from doy to date, being careful of year
+            date_index = []
+            index_year = self.year
+            for day in forecast_df.index:
+                date_index.append(day_of_year_to_date(index_year, day))
+                if day == 365:
+                    index_year += 1
+                    
             forecast_df.index = date_index
     
             # Putting together the forecast timeseries
             self.forecast_df = forecast_df
+            # fix dates here
             self.forecast_ts = TimeSeries.from_times_and_values(
                 forecast_df.index, 
-                samples
+                samples,
+                fill_missing_dates=True,
+                freq='D'
             )
             
         else:
@@ -166,7 +177,7 @@ class HistoricalForecaster():
             residual_list.append(residual)
 
         self.residuals = TimeSeries.from_times_and_values(self.training_set.time_index, 
-                                                          residual_list)  
+                                                          residual_list)
         
 def month_doy_range(year, month):
     # Get the first day of the month
@@ -515,7 +526,7 @@ class BaseForecaster():
     def _preprocess_data(self, data_preprocessor, train_set=True):
         """
         Performs gap filling and processing of data into format that
-        Darts models will accept
+        Darts models will accept; train_set flag is to 
         """
         stitched_series_dict = data_preprocessor.sites_dict[self.site_id]
 
@@ -538,6 +549,15 @@ class BaseForecaster():
                                                               axis=1, 
                                                               ignore_time_axis=True)
             covariates = covariates.median()
+
+            covs_train, _ = (
+                covariates
+                .median()
+                .split_after(self.split_date)
+            )
+        else:
+            covs_train = None
+            covariates = None
             
         # Taking the median now to accomodate using doy covariates
         training_set, validation_set = (
@@ -545,16 +565,11 @@ class BaseForecaster():
             .median()
             .split_after(self.split_date)
         )
-        covs_train, _ = (
-            covariates
-            .median()
-            .split_after(self.split_date)
-        )
 
         if train_set:
             return training_set, covs_train
         else:
-            return inputs.median(), covariates.median()
+            return inputs.median(), covariates
             
     def get_validation_set(self, scaler, input_chunk_length):
         # This function creates a sliding window across some preprocessed data
@@ -798,7 +813,7 @@ class BaseForecaster():
             training_set = self.scaler.fit_transform(self.training_set)
             validation_set = self.get_validation_set(
                 self.scaler,
-                hyperparams['input_chunk_length']
+                self.hyperparams['input_chunk_length']
             )
             extras["val_series"] = validation_set
 
@@ -829,7 +844,7 @@ class BaseForecaster():
         # excursion
         if "dropout" in list(self.model_likelihood.keys()):
             predict_kws["mc_dropout"] = True
-        import pdb; pdb.set_trace()
+
         predictions = self.model.predict( 
             series=predict_series, 
             **predict_kws
