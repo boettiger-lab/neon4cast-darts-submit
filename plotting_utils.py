@@ -8,6 +8,8 @@ from utils import (
 import seaborn as sns
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 import os
 from darts import TimeSeries
 import glob
@@ -15,56 +17,6 @@ import numpy as np
 import CRPS.CRPS as forecastscore
 from darts.metrics import rmse
 import matplotlib as mpl
-
-def plot_forecast(date, targets_df, site_id, target_variable, model_dir, plot_name=None):
-    cmap = mpl.colormaps["tab10"]
-    colors = cmap.colors
-    # Loading the forecast csv and creating a time series
-    csv_name = f"forecasts/{site_id}/{target_variable}/{model_dir}/forecast_{date}.csv"
-    df = pd.read_csv(csv_name)
-    times = pd.to_datetime(df["datetime"])
-    times = pd.DatetimeIndex(times)
-    values = df.loc[:, df.columns!="datetime"].to_numpy().reshape((len(times), 1, -1))
-    model_forecast = TimeSeries.from_times_and_values(times, 
-                                                      values, 
-                                                      fill_missing_dates=True, freq="D")
-    model_forecast.plot(label=f"{model_dir}", color=colors[0])
-
-    # Getting the validation series directly from the targets csv
-    date = model_forecast.time_index[0]
-    forecast_horizon = len(model_forecast)
-    validation_series = get_validation_series(
-        targets_df, 
-        site_id, 
-        target_variable, 
-        date, 
-        forecast_horizon
-    )
-
-    # Now, making the forecast based off of historical mean and std
-    historical_model = HistoricalForecaster(
-        targets=targets_df,
-        site_id=site_id,
-        target_variable=target_variable,
-        output_csv_name="historical_forecaster_output.csv",
-        validation_split_date=str(model_forecast.time_index[0])[:10],
-        forecast_horizon=len(model_forecast),
-    )
-    historical_model.make_forecasts()
-    historical_model.forecast_ts.plot(label="Historical", color=colors[1])
-    validation_series.plot(label="Truth", color=colors[2])
-    x = plt.xlabel("date")
-    y = plt.ylabel(target_variable)
-    ax = plt.gca()
-    ax.spines["left"].set_visible(True)
-    ax.spines["bottom"].set_visible(True)
-    plt.grid(False)
-
-    # Saving the plot if desired
-    if plot_name != None:
-        if not os.path.exists(f"plots/{site_id}/{target_variable}/"):
-            os.makedirs(f"plots/{site_id}/{target_variable}/")
-        plt.savefig(f"plots/{site_id}/{target_variable}/{plot_name}")
 
 def get_validation_series(targets_df, site_id, target_variable, date, forecast_horizon):
     # Being careful here with the date, note that I am matching the forecast,
@@ -134,6 +86,62 @@ def filter_forecast_df(forecast_df, validation_series):
     )
 
     return filtered_forecast_ts, validation_series
+
+def make_df_from_score_dict(score_dict):
+    # Create lists to store the data
+    site_id_list = []
+    date_list = []
+    metric_list = []
+    model_list = []
+    value_list = []
+    
+    # Iterate through the dictionary and extract data
+    for site_id, dates in score_dict.items():
+        for date, values in dates.items():
+            crps_forecast_array = values['crps_forecast']
+            crps_historical_array = values['crps_historical']
+            rmse_forecast = values['rmse_forecast']
+            rmse_historical = values['rmse_historical']
+    
+            # Add entries for 'crps', and 'forecast' and 'historical'
+            for historical_crps_val, forecast_crps_val in \
+        zip(crps_historical_array, crps_forecast_array):
+                site_id_list.append(site_id)
+                date_list.append(date)
+                metric_list.append('crps')
+                model_list.append('forecast')
+                value_list.append(forecast_crps_val)
+    
+                site_id_list.append(site_id)
+                date_list.append(date)
+                metric_list.append('crps')
+                model_list.append('historical')
+                value_list.append(historical_crps_val)
+    
+            # Add entries for 'rmse' and 'forecast'
+            site_id_list.append(site_id)
+            date_list.append(date)
+            metric_list.append('rmse')
+            model_list.append('forecast')
+            value_list.append(rmse_forecast)
+    
+            # Add entries for 'rmse' and 'historical'
+            site_id_list.append(site_id)
+            date_list.append(date)
+            metric_list.append('rmse')
+            model_list.append('historical')
+            value_list.append(rmse_historical)
+    
+    # Create a DataFrame
+    df = pd.DataFrame({
+        'site_id': site_id_list,
+        'date': date_list,
+        'metric': metric_list,
+        'model': model_list,
+        'value': value_list
+    })
+
+    return df
 
 def modify_score_dict(csv, targets_df, target_variable, site_id, suffix, score_dict, score_rmse=False):
     try:
@@ -226,6 +234,56 @@ def modify_score_dict(csv, targets_df, target_variable, site_id, suffix, score_d
         score_dict[time_str]["crps_historical"] = crps_scores.pd_dataframe().values[:, 0]
     return score_dict
 
+def plot_forecast(date, targets_df, site_id, target_variable, model_dir, plot_name=None):
+    cmap = mpl.colormaps["tab10"]
+    colors = cmap.colors
+    # Loading the forecast csv and creating a time series
+    csv_name = f"forecasts/{site_id}/{target_variable}/{model_dir}/forecast_{date}.csv"
+    df = pd.read_csv(csv_name)
+    times = pd.to_datetime(df["datetime"])
+    times = pd.DatetimeIndex(times)
+    values = df.loc[:, df.columns!="datetime"].to_numpy().reshape((len(times), 1, -1))
+    model_forecast = TimeSeries.from_times_and_values(times, 
+                                                      values, 
+                                                      fill_missing_dates=True, freq="D")
+    model_forecast.plot(label=f"{model_dir}", color=colors[0])
+
+    # Getting the validation series directly from the targets csv
+    date = model_forecast.time_index[0]
+    forecast_horizon = len(model_forecast)
+    validation_series = get_validation_series(
+        targets_df, 
+        site_id, 
+        target_variable, 
+        date, 
+        forecast_horizon
+    )
+
+    # Now, making the forecast based off of historical mean and std
+    historical_model = HistoricalForecaster(
+        targets=targets_df,
+        site_id=site_id,
+        target_variable=target_variable,
+        output_csv_name="historical_forecaster_output.csv",
+        validation_split_date=str(model_forecast.time_index[0])[:10],
+        forecast_horizon=len(model_forecast),
+    )
+    historical_model.make_forecasts()
+    historical_model.forecast_ts.plot(label="Historical", color=colors[1])
+    validation_series.plot(label="Truth", color=colors[2])
+    x = plt.xlabel("date")
+    y = plt.ylabel(target_variable)
+    ax = plt.gca()
+    ax.spines["left"].set_visible(True)
+    ax.spines["bottom"].set_visible(True)
+    plt.grid(False)
+
+    # Saving the plot if desired
+    if plot_name != None:
+        if not os.path.exists(f"plots/{site_id}/{target_variable}/"):
+            os.makedirs(f"plots/{site_id}/{target_variable}/")
+        plt.savefig(f"plots/{site_id}/{target_variable}/{plot_name}")
+
 def plot_crps_bydate(glob_prefix, targets_df, site_id, target_variable, suffix="", plot_name=None):
 
     plt.figure(figsize=(12, 8))
@@ -283,7 +341,7 @@ def plot_crps_bydate(glob_prefix, targets_df, site_id, target_variable, suffix="
     
 def score_improvement_bysite(model, targets_df, target_variable, suffix="", plot_name=None):
     score_dict = {}
-    
+    # For each site, score CRPS and RMSE individually and add to score_dict
     for site_id in targets_df.site_id.unique():
         site_dict = {}
         glob_prefix = f'forecasts/{site_id}/{target_variable}/{model}_{suffix}/forecast*'
@@ -308,6 +366,7 @@ def score_improvement_bysite(model, targets_df, target_variable, suffix="", plot
             )
         score_dict[site_id] = site_dict
     df = make_df_from_score_dict(score_dict)
+
     df = df.groupby(['site_id', 'date', 'metric', 'model']).mean().reset_index()
 
     # Filtering
@@ -343,29 +402,73 @@ def score_improvement_bysite(model, targets_df, target_variable, suffix="", plot
         (pivot_df['crps_positive_improvement'] + pivot_df['rmse_positive_improvement']) == 2
     )
 
-    # Find the percentage of forecast windows during which the ML model excelled 
-    # the historical forecaster
-    result_df = pivot_df[['site_id', 'combined_improvement']].groupby(['site_id']).mean() * 100
-    result_df.reset_index(inplace=True)
-    # Rename the 'combined_improvement' column to 'combined_improvement_percentage'
-    result_df.rename(columns={'combined_improvement': 'combined_improvement_percentage'}, inplace=True)
+    pivot_df['model'] = model
+    return pivot_df
 
-    # Marking the sites at which 
-    result_df['above_50'] = result_df['combined_improvement_percentage'] > 50
+def plot_improvement_bysite(score_df, metadata_df, title_name):
+    ## Find the percentage of forecast windows during which the ML model excelled 
+    ## the historical forecaster
+    score_df = score_df[['site_id', 'combined_improvement']].groupby(['site_id']).mean() * 100
+    score_df.reset_index(inplace=True)
+    ## Rename the 'combined_improvement' column to 'combined_improvement_percentage'
+    score_df.rename(columns={'combined_improvement': 'combined_improvement_percentage'}, inplace=True)
 
-    return result_df
+    ## Marking the sites at which 
+    score_df['above_50'] = score_df['combined_improvement_percentage'] > 50
 
-def plot_improvement_bysite(df, title_name):
+    # Combining df's to include metadata
+    df = pd.merge(
+        score_df, 
+        metadata_df, 
+        right_on='field_site_id', 
+        left_on='site_id'
+    ).drop(columns=['field_site_id'])
+    
     plt.figure(figsize=(12, 8))
     custom_palette = {True: 'tab:blue', False: 'indianred'}
+    markers = {'Wadeable Stream': 's', 'Lake': 'o', 'Non-wadeable River': '^'}
 
+    for site_type in ['Wadeable Stream', 'Lake', 'Non-wadeable River']:
+        
+        sns.pointplot(
+            data=df.loc[df.field_site_subtype == site_type],
+            x='site_id',
+            y='combined_improvement_percentage',
+            linestyle='',
+            hue='above_50',
+            palette=custom_palette,
+            markers=markers[site_type],
+        )
+
+    plt.grid(False)
+    plt.ylabel("% of CRPS and RMSE Improvement over Historical")
+    ax = plt.gca()
+    ax.spines["left"].set_visible(True)
+    ax.spines["bottom"].set_visible(True)
+    plt.xticks(rotation=30)
+    plt.legend(labels=[])
+    plt.title(title_name)
+
+def plot_global_percentages(df_, title_name):
+    plt.figure(figsize=(12, 8))
+    custom_palette = {True: 'tab:blue', False: 'indianred'}
+    
+    global_percentages = df_[['model', 'combined_improvement']].groupby(['model']).mean() * 100
+    global_percentages.reset_index(inplace=True)
+    global_percentages.rename(
+        columns={'combined_improvement': 'combined_improvement_percentage'}, 
+        inplace=True
+    )
+
+    # Marking the sites at which 
+    global_percentages['above_50'] = global_percentages['combined_improvement_percentage'] > 50
     sns.pointplot(
-        df,
+        data=global_percentages,
+        x='model',
         y='combined_improvement_percentage',
-        x='site_id',
         linestyle='',
         hue='above_50',
-        palette=custom_palette
+        palette=custom_palette,
     )
 
     plt.grid(False)
@@ -377,58 +480,210 @@ def plot_improvement_bysite(df, title_name):
     plt.legend(labels=[])
     plt.title(title_name)
 
-def make_df_from_score_dict(score_dict):
-    # Create lists to store the data
-    site_id_list = []
-    date_list = []
-    metric_list = []
-    model_list = []
-    value_list = []
-    
-    # Iterate through the dictionary and extract data
-    for site_id, dates in score_dict.items():
-        for date, values in dates.items():
-            crps_forecast_array = values['crps_forecast']
-            crps_historical_array = values['crps_historical']
-            rmse_forecast = values['rmse_forecast']
-            rmse_historical = values['rmse_historical']
-    
-            # Add entries for 'crps', and 'forecast' and 'historical'
-            for historical_crps_val, forecast_crps_val in \
-        zip(crps_historical_array, crps_forecast_array):
-                site_id_list.append(site_id)
-                date_list.append(date)
-                metric_list.append('crps')
-                model_list.append('forecast')
-                value_list.append(forecast_crps_val)
-    
-                site_id_list.append(site_id)
-                date_list.append(date)
-                metric_list.append('crps')
-                model_list.append('historical')
-                value_list.append(historical_crps_val)
-    
-            # Add entries for 'rmse' and 'forecast'
-            site_id_list.append(site_id)
-            date_list.append(date)
-            metric_list.append('rmse')
-            model_list.append('forecast')
-            value_list.append(rmse_forecast)
-    
-            # Add entries for 'rmse' and 'historical'
-            site_id_list.append(site_id)
-            date_list.append(date)
-            metric_list.append('rmse')
-            model_list.append('historical')
-            value_list.append(rmse_historical)
-    
-    # Create a DataFrame
-    df = pd.DataFrame({
-        'site_id': site_id_list,
-        'date': date_list,
-        'metric': metric_list,
-        'model': model_list,
-        'value': value_list
-    })
+def plot_site_type_percentages_global(df_, metadata_df, title_name):
+    plt.figure(figsize=(12, 8))
+    custom_palette = {True: 'tab:blue', False: 'indianred'}
 
-    return df
+    # Combining df's to include metadata
+    df = pd.merge(
+        df_, 
+        metadata_df, 
+        right_on='field_site_id', 
+        left_on='site_id'
+    ).drop(columns=['field_site_id'])
+    
+    results = df[['combined_improvement', 'field_site_subtype']].groupby(['field_site_subtype']).mean() * 100
+    results.reset_index(inplace=True)
+    results.rename(
+        columns={'combined_improvement': 'combined_improvement_percentage'}, 
+        inplace=True
+    )
+
+    # Marking the sites at which 
+    results['above_50'] = results['combined_improvement_percentage'] > 50
+    sns.pointplot(
+        data=results,
+        x='field_site_subtype',
+        y='combined_improvement_percentage',
+        linestyle='',
+        hue='above_50',
+        palette=custom_palette,
+    )
+
+    plt.grid(False)
+    plt.ylabel("% of CRPS and RMSE Improvement over Historical")
+    ax = plt.gca()
+    ax.spines["left"].set_visible(True)
+    ax.spines["bottom"].set_visible(True)
+    plt.xticks(rotation=30)
+    plt.legend(labels=[])
+    plt.title(title_name)
+
+def plot_site_type_percentages_bymodel(df_, metadata_df, title_name):
+    plt.figure(figsize=(12, 8))
+    custom_palette = {True: 'tab:blue', False: 'indianred'}
+    markers = {'Wadeable Stream': 's', 'Lake': 'o', 'Non-wadeable River': '^'}
+
+    # Combining df's to include metadata
+    df = pd.merge(
+        df_, 
+        metadata_df, 
+        right_on='field_site_id', 
+        left_on='site_id'
+    ).drop(columns=['field_site_id'])
+    
+    results = df[[
+        'combined_improvement', 
+        'field_site_subtype', 
+        'model'
+    ]].groupby(['field_site_subtype', 'model']).mean() * 100
+    
+    results.reset_index(inplace=True)
+    results.rename(
+        columns={'combined_improvement': 'combined_improvement_percentage'}, 
+        inplace=True
+    )
+
+    # Marking the sites at which 
+    results['above_50'] = results['combined_improvement_percentage'] > 50
+
+    for site_type in ['Wadeable Stream', 'Lake', 'Non-wadeable River']:
+        sns.pointplot(
+            data=results.loc[results.field_site_subtype == site_type],
+            x='model',
+            y='combined_improvement_percentage',
+            linestyle='',
+            hue='above_50',
+            palette=custom_palette,
+            markers=markers[site_type],
+        )
+
+    plt.grid(False)
+    plt.ylabel("% of CRPS and RMSE Improvement over Historical")
+    ax = plt.gca()
+    ax.spines["left"].set_visible(True)
+    ax.spines["bottom"].set_visible(True)
+    plt.xticks(rotation=30)
+    plt.title(title_name)
+    # Create your custom legend elements
+    triangle = Line2D([0], [0], marker='^', color='w', markerfacecolor='grey', markersize=8, label='Non-wadeable River')
+    circle = Line2D([0], [0], marker='o', color='w', markerfacecolor='grey', markersize=8, label='Lake')
+    square = Line2D([0], [0], marker='s', color='w', markerfacecolor='grey', markersize=8, label='Wadeable Stream')
+    
+    # Create a custom legend
+    legend_elements = [triangle, circle, square]
+    plt.legend(labels=[])
+    ax.legend(handles=legend_elements, loc='upper right')
+
+def plot_window_and_sitetype_performance(model_df, metadata_df, title_name):
+    plt.figure(figsize=(12, 8))
+    custom_palette = {True: 'tab:blue', False: 'indianred'}
+    markers = {'Wadeable Stream': 's', 'Lake': 'o', 'Non-wadeable River': '^'}
+
+    # Combining df's to include metadata
+    df = pd.merge(
+        model_df, 
+        metadata_df, 
+        right_on='field_site_id', 
+        left_on='site_id'
+    ).drop(columns=['field_site_id'])
+    
+    results = df[[
+        'combined_improvement', 
+        'field_site_subtype',
+        'date'
+    ]].groupby(['field_site_subtype', 'date']).mean() * 100
+    
+    results.reset_index(inplace=True)
+    results.rename(
+        columns={'combined_improvement': 'combined_improvement_percentage'}, 
+        inplace=True
+    )
+
+    # Marking the sites at which 
+    results['above_50'] = results['combined_improvement_percentage'] > 50
+
+    for site_type in ['Wadeable Stream', 'Lake', 'Non-wadeable River']:
+        sns.pointplot(
+            data=results.loc[results.field_site_subtype == site_type],
+            x='date',
+            y='combined_improvement_percentage',
+            linestyle='',
+            hue='above_50',
+            palette=custom_palette,
+            markers=markers[site_type],
+        )
+
+    plt.grid(False)
+    plt.ylabel("% of CRPS and RMSE Improvement over Historical")
+    ax = plt.gca()
+    ax.spines["left"].set_visible(True)
+    ax.spines["bottom"].set_visible(True)
+    plt.xticks(rotation=30)
+    plt.title(title_name)
+    # Create your custom legend elements
+    triangle = Line2D([0], [0], marker='^', color='w', markerfacecolor='grey', markersize=8, label='Non-wadeable River')
+    circle = Line2D([0], [0], marker='o', color='w', markerfacecolor='grey', markersize=8, label='Lake')
+    square = Line2D([0], [0], marker='s', color='w', markerfacecolor='grey', markersize=8, label='Wadeable Stream')
+    
+    # Create a custom legend
+    legend_elements = [triangle, circle, square]
+    plt.legend(labels=[])
+    ax.legend(handles=legend_elements, loc='upper right')
+
+def plot_region_percentages(df_, metadata_df, title_name):
+    plt.figure(figsize=(12, 8))
+    custom_palette = {True: 'tab:blue', False: 'indianred'}
+    markers = {'Wadeable Stream': 's', 'Lake': 'o', 'Non-wadeable River': '^'}
+
+    # Combining df's to include metadata
+    df = pd.merge(
+        df_, 
+        metadata_df, 
+        right_on='field_site_id', 
+        left_on='site_id'
+    ).drop(columns=['field_site_id'])
+    
+    results = df[[
+        'combined_improvement', 
+        'region',
+        'field_site_subtype'
+    ]].groupby(['field_site_subtype', 'region']).mean() * 100
+    
+    results.reset_index(inplace=True)
+    results.rename(
+        columns={'combined_improvement': 'combined_improvement_percentage'}, 
+        inplace=True
+    )
+
+    # Marking the sites at which 
+    results['above_50'] = results['combined_improvement_percentage'] > 50
+
+    for site_type in ['Wadeable Stream', 'Lake', 'Non-wadeable River']:
+        sns.pointplot(
+            data=results.loc[results.field_site_subtype == site_type],
+            x='region',
+            y='combined_improvement_percentage',
+            linestyle='',
+            hue='above_50',
+            palette=custom_palette,
+            markers=markers[site_type],
+        )
+
+    plt.grid(False)
+    plt.ylabel("% of CRPS and RMSE Improvement over Historical")
+    ax = plt.gca()
+    ax.spines["left"].set_visible(True)
+    ax.spines["bottom"].set_visible(True)
+    plt.xticks(rotation=30)
+    plt.title(title_name)
+    # Create your custom legend elements
+    triangle = Line2D([0], [0], marker='^', color='w', markerfacecolor='grey', markersize=8, label='Non-wadeable River')
+    circle = Line2D([0], [0], marker='o', color='w', markerfacecolor='grey', markersize=8, label='Lake')
+    square = Line2D([0], [0], marker='s', color='w', markerfacecolor='grey', markersize=8, label='Wadeable Stream')
+    
+    # Create a custom legend
+    legend_elements = [triangle, circle, square]
+    plt.legend(labels=[])
+    ax.legend(handles=legend_elements, loc='upper right')
+
