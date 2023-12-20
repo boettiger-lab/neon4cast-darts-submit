@@ -9,7 +9,7 @@ models=("BlockRNN" "Transformer" "NLinear" "DLinear" "NBEATS" "TCN")
 for model in "${models[@]}"; do
   > "logs/$2/$1/train_${model}.log"
   python -u train_tune.py --model "$model" --target "$1" --site "$2" \
-    --date 2023-03-09 --epochs "$3" &> "logs/$2/$1/train_${model}.log" &
+    --epochs "$3" &> "logs/$2/$1/train_${model}.log" &
 done
 
 # Need to treat RNN and TFT separately as they don't accept past covariates
@@ -18,5 +18,5 @@ models=("RNN" "TFT")
 for model in "${models[@]}"; do
   > "logs/$2/$1/train_${model}.log"
   python -u train_tune.py --model "$model" --target $1 --site "$2" \
-    --date 2023-03-09 --epochs "$3" --nocovs &> "logs/$2/$1/train_${model}.log" &
+    --epochs "$3" --nocovs &> "logs/$2/$1/train_${model}.log" &
 done

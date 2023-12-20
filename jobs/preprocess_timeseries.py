@@ -11,10 +11,26 @@ if __name__=="__main__":
     start = time.time()
     os.environ["CUDA_VISIBLE_DEVICES"] = "1"
     targets = pd.read_csv("targets.csv.gz")
-    
-    data_preprocessor = TimeSeriesPreprocessor()
+
+    # For the training set
+    data_preprocessor = TimeSeriesPreprocessor(
+        validation_split_date='2022-07-19',
+        load_dir_name='preprocessed_train/',
+    )
     
     _ = [data_preprocessor.preprocess_data(site) for site in targets.site_id.unique()]
     
     data_preprocessor.save()
+
+    # For the validation set
+    data_preprocessor = TimeSeriesPreprocessor(
+        validation_split_date='2023-07-19',
+        load_dir_name='preprocessed_validate/',
+    )
+    
+    _ = [data_preprocessor.preprocess_data(site) for site in targets.site_id.unique()]
+    
+    data_preprocessor.save()
+
+    
     print ("Runtime to preprocess the time series: ", time.time()-start)
