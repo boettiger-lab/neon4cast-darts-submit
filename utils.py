@@ -2,7 +2,6 @@ from darts import TimeSeries
 from typing import Optional
 import pandas as pd
 import matplotlib.pyplot as plt
-from optuna.integration import PyTorchLightningPruningCallback
 import pandas as pd
 from darts.models import GaussianProcessFilter
 from darts import TimeSeries
@@ -31,24 +30,32 @@ import pdb
 import argparse
 import copy
 import numpy as np
+from torchmetrics import SymmetricMeanAbsolutePercentageError
+from pytorch_lightning.callbacks.early_stopping import EarlyStopping
+import warnings
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
-def crps(forecast, observed):
+def crps(forecast, observed, observed_is_ts=False):
     """
-    Returns an array of CRPS scores 
+    Returns an array of CRPS scores; assumes forecast 
     """
     forecast_array = forecast.pd_dataframe(suppress_warnings=True).values
-
+    if observed_is_ts:
+        observed = observed.pd_dataframe(suppress_warnings=True).values.reshape((-1,))
     crps_scores = []
     for i in range(len(forecast_array)):
         # Note forecastscore is CRPS.CRPS
         crps, _, __ = forecastscore(forecast_array[i], observed[i]).compute()
         crps_scores.append(crps)
 
-    crps_scores = TimeSeries.from_times_and_values(forecast.time_index, 
-                                     crps_scores, 
-                                     fill_missing_dates=True, freq="D")
+    crps_scores = TimeSeries.from_times_and_values(
+        forecast.time_index, 
+        crps_scores, 
+        fill_missing_dates=True, 
+        freq="D"
+    )
+    
     return crps_scores
 
 
@@ -110,9 +117,11 @@ class HistoricalForecaster():
         the forecast
         """
         # Getting the doys for the forecast window
-        forecast_doys = pd.date_range(start=self.validation_split_date, 
-                                      periods=self.forecast_horizon, 
-                                      freq='D').dayofyear
+        forecast_doys = pd.date_range(
+            start=self.validation_split_date, 
+            periods=self.forecast_horizon, 
+            freq='D',
+        ).dayofyear
         forecast_df = self.doy_df.loc[forecast_doys]
 
 
@@ -129,13 +138,25 @@ class HistoricalForecaster():
             
         # Catching case where there is no sensor data at all for that site
         if not np.isnan(samples.mean()):
-            # Now creating an index going from doy to date
-            date_index = [day_of_year_to_date(self.year, day) for day in forecast_df.index]
+            # Now creating an index going from doy to date, being careful of year
+            date_index = []
+            index_year = self.year
+            for day in forecast_df.index:
+                date_index.append(day_of_year_to_date(index_year, day))
+                if day == 365:
+                    index_year += 1
+                    
             forecast_df.index = date_index
     
             # Putting together the forecast timeseries
             self.forecast_df = forecast_df
-            self.forecast_ts = TimeSeries.from_times_and_values(forecast_df.index, samples)
+            # fix dates here
+            self.forecast_ts = TimeSeries.from_times_and_values(
+                forecast_df.index, 
+                samples,
+                fill_missing_dates=True,
+                freq='D'
+            )
             
         else:
             self.forecast_df = None
@@ -145,7 +166,7 @@ class HistoricalForecaster():
     def get_residuals(self):
         # This needs to be re-examined!!!
         residual_list = []
-        # Going through each date and finding the difference between the doy historical mean and
+        # Finding the difference between the doy historical mean and
         # the observed value
         for date in self.training_set.time_index:
             doy = date.dayofyear
@@ -156,15 +177,63 @@ class HistoricalForecaster():
             residual_list.append(residual)
 
         self.residuals = TimeSeries.from_times_and_values(self.training_set.time_index, 
-                                                          residual_list)  
+                                                          residual_list)
         
+def month_doy_range(year, month):
+    # Get the first day of the month
+    first_day = datetime(year, month, 1)
+
+    # Calculating the last day of the month
+    if month == 12:
+        last_day = datetime(year + 1, 1, 1) - timedelta(days=1)
+    else:
+        last_day = datetime(year, month + 1, 1) - timedelta(days=1)
+
+    # Finding the day of year for the first and last day
+    doy_first_day = first_day.timetuple().tm_yday
+    doy_last_day = last_day.timetuple().tm_yday
+
+    return doy_first_day, doy_last_day
+
+def season_doy_range(year, month, day):
+    # Given date
+    given_date = datetime(year, month, day)
+
+    # Arbitrarily definine the start and end dates for each season
+    spring_start = datetime(year, 3, 1)
+    summer_start = datetime(year, 6, 1)
+    fall_start = datetime(year, 9, 1)
+    winter_start = datetime(year, 12, 1)
+
+    # Determine the season based on the given date
+    if given_date < spring_start or given_date >= datetime(year + 1, 3, 1):
+        season = "winter"
+        start_date = winter_start
+        end_date = datetime(year + 1, 2, 28)  # Assuming non-leap year
+    elif given_date < summer_start:
+        season = "spring"
+        start_date = spring_start
+        end_date = summer_start - timedelta(days=1)
+    elif given_date < fall_start:
+        season = "summer"
+        start_date = summer_start
+        end_date = fall_start - timedelta(days=1)
+    elif given_date < winter_start:
+        season = "fall"
+        start_date = fall_start
+        end_date = winter_start - timedelta(days=1)
+
+    # Calculate the DOY range for the determined season
+    doy_start = start_date.timetuple().tm_yday
+    doy_end = end_date.timetuple().tm_yday
+
+    return doy_start, doy_end
 
 class TimeSeriesPreprocessor():
     def __init__(self,
                  input_csv_name = "targets.csv.gz",
                  load_dir_name: Optional[str] = "preprocessed_timeseries/",
                  datetime_column_name: Optional[str] = "datetime",
-                 covariates_names: Optional[list] = None,
                  validation_split_date: Optional[str] = "2023-03-09",
                  filter_kw_args: Optional[dict] = {"alpha_0": 0.001,
                                                    "n_restarts_0": 100,
@@ -206,7 +275,12 @@ class TimeSeriesPreprocessor():
     
         # If there is a gap over 7 indices, use big gap filter
         gap_series = self.var_tseries_dict[var].gaps()
-        stitched_df = filtered.pd_dataframe()
+        stitched_df = filtered.pd_dataframe(suppress_warnings=True)
+        
+        # Ignoring runtime warnings in this function only
+        # This is because I allow means to be found of empty arrays,
+        # yielding NaNs, which is certainly not elegant
+        warnings.filterwarnings("ignore", category=RuntimeWarning)
 
         # For these big gaps, I replace with samples centered on historical mean and std
         for index, row in gap_series.iterrows():
@@ -216,22 +290,61 @@ class TimeSeriesPreprocessor():
                     # and avoiding leap year errors
                     try:
                         mean, std = self.doy_dict[var].loc[min(date.dayofyear, 365)]
+                        # If there is an issue, use the median daily historical data
+                        # over that month
                         if np.isnan(mean):
-                            mean = self.doy_dict[var]['mean'].median()
+                            month_range = month_doy_range(date.year, date.month)
+                            mean = (
+                                self.doy_dict[var]
+                                .loc[month_range[0]:month_range[1]]['mean']
+                                .median()
+                            )
+                            if np.isnan(mean):
+                                # And if this is still NaN, aggregate over the season
+                                season_range = season_doy_range(
+                                    date.year, date.month, date.day
+                                )
+                                mean = (
+                                    self.doy_dict[var]
+                                    .loc[season_range[0]:season_range[1]]['mean']
+                                    .median()
+                                )
                         if np.isnan(std):
-                            std = self.doy_dict[var]['std'].median()
+                            # Not exactly sure why but filtering looks way better
+                            # if I use the std over a season; this ends up not mattering
+                            # as the model only uses the median.
+                            season_range = season_doy_range(
+                                    date.year, date.month, date.day
+                            )
+                            std = (
+                                self.doy_dict[var]
+                                .loc[season_range[0]:season_range[1]]['std']
+                                .median()
+                            )
+                        if np.isnan(std) or np.isnan(mean):
+                            raise ValueError
                     except:
-                        # If there is an issue, use the global mean and std
-                        mean = self.doy_dict[var]['mean'].median()
-                        std = self.doy_dict[var]['std'].median()
+                        # If above conditions fail use the previous date's samples, and
+                        # if there is an issue with accessing a previous date, 
+                        # use global
+                       try:
+                           mean = stitched_df.loc[previous_date].median()
+                           std = stitched_df.loc[previous_date].std()
+                       except:
+                           mean = self.doy_dict[var]['mean'].median()
+                           std = self.doy_dict[var]['std'].max()
+
                     stitched_df.loc[date] = np.random.normal(mean, std, size=(500,))
+                    previous_date = date
         
         stitched_series = TimeSeries.from_times_and_values(
-                                    stitched_df.index, 
-                                    stitched_df.values.reshape(
-                                                len(stitched_df), 
-                                                1, 
-                                                -1))
+                              stitched_df.index, 
+                              stitched_df.values.reshape(
+                                  len(stitched_df), 
+                                  1, 
+                                  -1,
+                              )
+        )
         
         return stitched_series
 
@@ -240,6 +353,7 @@ class TimeSeriesPreprocessor():
         Performs gap filling and processing of data into format that
         Darts models will accept
         """
+        self.sites_dict_null = {}
         # Preparing a dataframe
         site_df = self.df.loc[self.df.site_id == site]
         times = pd.to_datetime(site_df[self.datetime_column_name])
@@ -307,7 +421,7 @@ class TimeSeriesPreprocessor():
         # Saving each TimeSeries
         for site in self.sites_dict.keys():
             for variable in self.sites_dict[site]:
-                self.sites_dict[site][variable].pd_dataframe()\
+                self.sites_dict[site][variable].pd_dataframe(suppress_warnings=True)\
                     .to_csv(f"{self.load_dir_name}{site}-{variable}.csv")
 
     def load(self, site):
@@ -353,11 +467,12 @@ class TimeSeriesPreprocessor():
 class BaseForecaster():
     def __init__(self,
                  model: Optional[str] = None,
-                 data_preprocessor: Optional = None,
+                 train_preprocessor: Optional = None,
+                 validate_preprocessor: Optional = None,
                  target_variable: Optional[str] = None,
                  datetime_column_name: Optional[str] = "datetime",
                  covariates_names: Optional[list] = None,
-                 output_csv_name: Optional[str] = "residual_forecaster_output.csv",
+                 output_csv_name: Optional[str] = "default",
                  validation_split_date: Optional[str] = "2023-03-09", #YYYY-MM-DD n.b. this is inclusive
                  model_hyperparameters: Optional[dict] = None,
                  model_likelihood: Optional[dict] = None,
@@ -380,7 +495,7 @@ class BaseForecaster():
                        "NBEATS": NBEATSModel,
                        "Linear": LinearRegressionModel,
                        "TFT": TFTModel}[model]
-        self.data_preprocessor = data_preprocessor
+        self.validate_preprocessor = validate_preprocessor
         self.target_variable = target_variable
         self.datetime_column_name = datetime_column_name
         self.covariates_names = covariates_names
@@ -404,37 +519,111 @@ class BaseForecaster():
         self.model_likelihood = model_likelihood
         # Try to get validation set from targets and not preprocessor
 
-        self._preprocess_data()
+        self.training_set, self.covs_train = self._preprocess_data(train_preprocessor)
+        self.inputs, self.covariates = self._preprocess_data(validate_preprocessor,
+                                                             train_set=False)
         
-    def _preprocess_data(self):
+    def _preprocess_data(self, data_preprocessor, train_set=True):
         """
         Performs gap filling and processing of data into format that
-        Darts models will accept
+        Darts models will accept; train_set flag is to 
         """
-        stitched_series_dict = self.data_preprocessor.sites_dict[self.site_id]
+        stitched_series_dict = data_preprocessor.sites_dict[self.site_id]
 
-        # If there was failure when doing the GP fit then we can't do preprocessing
+        # If there was failure when filtering then we can't do preprocessing
         if self.target_variable in \
-                self.data_preprocessor.site_missing_variables:
+                data_preprocessor.site_missing_variables:
             return "Cannot fit this target time series as no GP fit was performed."
-        self.inputs = stitched_series_dict[self.target_variable]
+        inputs = stitched_series_dict[self.target_variable]
 
         if self.covariates_names is not None:
             # And not using the covariates that did not yield GP fits beforehand
-            for null_variable in self.data_preprocessor.site_missing_variables:
-                self.covariates_names.remove(null_variable)
+            for null_variable in data_preprocessor.site_missing_variables:
+                if null_variable in self.covariates_names:
+                    self.covariates_names.remove(null_variable)
     
             # Initializing covariates list then concatenating in for loop
-            self.covariates = stitched_series_dict[self.covariates_names[0]]
+            covariates = stitched_series_dict[self.covariates_names[0]]
             for cov_var in self.covariates_names[1:]:
-                self.covariates = self.covariates.concatenate(stitched_series_dict[cov_var], 
+                covariates = covariates.concatenate(stitched_series_dict[cov_var], 
                                                               axis=1, 
                                                               ignore_time_axis=True)
-            self.covariates = self.covariates.median()
+            covariates = covariates.median()
+
+            covs_train, _ = (
+                covariates
+                .median()
+                .split_after(self.split_date)
+            )
+        else:
+            covs_train = None
+            covariates = None
             
         # Taking the median now to accomodate using doy covariates
-        self.training_set = self.inputs.median()
+        training_set, validation_set = (
+            inputs
+            .median()
+            .split_after(self.split_date)
+        )
 
+        if train_set:
+            return training_set, covs_train
+        else:
+            return inputs.median(), covariates
+            
+    def get_validation_set(self, scaler, input_chunk_length):
+        # This function creates a sliding window across some preprocessed data
+        # so we can see how the model performs at different times of the year
+        interval = pd.Timedelta(days=self.forecast_horizon)
+        dates = pd.date_range(self.split_date + interval, periods=12, freq=interval)
+        val_set_list = []
+        for date in dates:
+            val_set_list.append(
+                scaler.transform(
+                    self.inputs.slice_n_points_before(
+                        date, 
+                        self.forecast_horizon + input_chunk_length
+                    )
+                )
+            )
+        return val_set_list
+
+    def get_predict_set(self, scaler, input_chunk_length):
+        # Similar to get_validation_set, except here I want to create 
+        # a window that just has the data to use as an input, nothing to validate
+        # a prediction
+        interval = pd.Timedelta(days=self.forecast_horizon)
+        dates = pd.date_range(self.split_date, periods=12, freq=interval)
+        predict_set_list = []
+        for date in dates:
+            predict_set_list.append(
+                scaler.transform(
+                    self.inputs.slice_n_points_before(
+                        date, 
+                        input_chunk_length
+                    )
+                )
+            )
+        return predict_set_list
+
+    def get_check_set(self, scaler, input_chunk_length):
+        # Here I am doing the complementary half of get_predict_set,
+        # which is getting a "ground truth" for the history provided
+        # by get_predict
+        interval = pd.Timedelta(days=self.forecast_horizon)
+        dates = pd.date_range(self.split_date, periods=12, freq=interval)
+        check_set_list = []
+        for date in dates:
+            check_set_list.append(
+                scaler.transform(
+                    self.inputs.slice_n_points_after(
+                        date + pd.Timedelta(1), 
+                        self.forecast_horizon
+                    )
+                )
+            )
+        return check_set_list 
+        
     def tune(self,
              hyperparameter_dict: Optional[dict]
             ):
@@ -442,37 +631,65 @@ class BaseForecaster():
         Sets up Optuna trial to perform hyperparameter tuning
         Input dictionary will be of the form {"hyperparamter": [values to be tested]}
         """
-        self.validation_set = self.get_validation_set()
-        if len(self.validation_set) != self.forecast_horizon:
-            raise Exception(f"There is missing data in the specified forecast window at {self.site_id}. " + \
-                            "This site will not be used for evaluating hyperparameters.")
         # Setting up an optuna Trial
         def objective(trial):
-            callback = [PyTorchLightningPruningCallback(trial, monitor="val_loss")]
+            # Selecting hyperparameters for the trial
             hyperparams = {key: trial.suggest_categorical(key, value) 
                                                for key, value in hyperparameter_dict.items()}
 
-            # Need to handle lags and time axis encoders
+            # Will stop training when validation loss does not decrease more than 0.05 (`min_delta`) over
+            # a period of 5 epochs (`patience`)
+            my_stopper = EarlyStopping(
+                monitor="val_loss",
+                patience=10,
+                min_delta=0.05,
+                mode='min',
+            )
+            pl_trainer_kwargs={"callbacks": [my_stopper]}
+            # And watching SMAPE
+            torch_metrics = SymmetricMeanAbsolutePercentageError()
+
+            # Need to format some hypers
             hyperparams = self.prepare_hyperparams(hyperparams)
 
-            model = self.model_(**hyperparams,
-                                output_chunk_length=self.forecast_horizon,
-                                **self.model_likelihood,
-                                random_state=self.seed)
+            model = self.model_(
+                **hyperparams,
+                output_chunk_length=self.forecast_horizon,
+                **self.model_likelihood,
+                random_state=self.seed,
+                pl_trainer_kwargs=pl_trainer_kwargs,
+                torch_metrics=torch_metrics
+            )
 
             extras = {"verbose": False,
                       "epochs": self.epochs}
             predict_kws = {"n": self.forecast_horizon,
                            "num_samples": self.num_samples}
             self.scaler = Scaler()
-            # Need to treat transformation differently if models use covariates or not
+            self.scaler_cov = Scaler()
+            # Some models don't use past covariates, so the inputs
+            # for these classes of models need to be handled differently
             if self.covariates is not None:
-                training_set, covariates = self.scaler.fit_transform([self.training_set.median(),
-                                                                      self.covariates.median()])
+                training_set = self.scaler.fit_transform(self.training_set)
+                covariates = self.scaler_cov.fit_transform(self.covs_train)
                 extras["past_covariates"] = covariates
-                predict_kws["past_covariates"] = covariates
+                # Handling training and validation series + covariates differently
+                # because they were preprocessed separately
+                extras['val_series'] = self.get_validation_set(
+                    self.scaler,
+                    hyperparams['input_chunk_length']
+                )
+                extras["val_past_covariates"] = [
+                    self.scaler_cov.transform(self.covariates) \
+                      for i in range(len(extras['val_series']))
+                ]
             else:
-                training_set = self.scaler.fit_transform(self.training_set.median())
+                training_set = self.scaler.fit_transform(self.training_set)
+                validation_set = self.get_validation_set(
+                    self.scaler,
+                    hyperparams['input_chunk_length']
+                )
+                extras["val_series"] = validation_set
 
             # Need to delete epochs which aren't used in the regression models
             if self.model_ == XGBModel or self.model_ == LinearRegressionModel:
@@ -483,17 +700,51 @@ class BaseForecaster():
              " misalignment between the training set and the specified validation" +\
              " split date. Note that the validation split date is defined to" +\
              " include the last date of the training set."
-            
-            model.fit(training_set, **extras)
-            
-            predictions = model.predict(**predict_kws)
-            predictions = self.scaler.inverse_transform(predictions)
 
-            crps_ = crps(predictions, 
-                         self.validation_set,
-                        )
+            model.fit(training_set, **extras)
+
+            # Preparing the series and covariates to input to the predict call
+            predict_series = self.get_predict_set(
+                self.scaler,
+                hyperparams['input_chunk_length']
+            )
             
-            crps_mean = crps_.mean(axis=0).values()[0][0]
+            predict_kws = {'num_samples': 500}
+            if self.covariates is not None:
+                predict_kws['past_covariates'] = extras['val_past_covariates']
+
+            predictions = model.predict(
+                n=self.forecast_horizon, 
+                series=predict_series, 
+                **predict_kws
+            )
+            
+            check_predictions = self.get_check_set(
+                self.scaler,
+                hyperparams['input_chunk_length']
+            )
+
+            # Making sure that predictions and their solutions align in dates
+            assert (
+                predictions[0].time_index[0] == check_predictions[0].time_index[0]
+            ), "Error with date alignment on tuning check"
+
+            # Computing CRPS for each prediction window from the validation set
+            # and taking the mean of these values.
+            crps_list = []
+            for i in range(len(predictions)):
+                crps_list.append(
+                    crps(
+                        predictions[i],
+                        check_predictions[i],
+                        observed_is_ts=True
+                    ).pd_dataframe(suppress_warnings=True).values
+                ) 
+            crps_mean = np.array(crps_list).mean()
+
+            # Tuning will provide the score with the lowest mean CRPS over
+            # the validation set which includes 11 evenly-spaced windows
+            # over the year
             return crps_mean if crps_mean != np.nan else float("inf")
 
         study = optuna.create_study(direction="minimize")
@@ -502,56 +753,69 @@ class BaseForecaster():
         
         self.hyperparams = study.best_trial.params
         self.tuned = True
-
-    def get_validation_set(self):
-        # take validation_split_date and add number of dates
-        date_range = pd.date_range(self.split_date + pd.DateOffset(days=1), 
-                                   periods=self.forecast_horizon, 
-                                   freq='D')
-        # Filter targets df for site and variable
-        site_df = self.targets_df[self.targets_df["site_id"] == self.site_id]
-        site_var_df_ = site_df[["datetime", self.target_variable]]
-        site_var_df = site_var_df_.copy()
-        site_var_df["datetime"] = pd.to_datetime(site_var_df_["datetime"])
-        validation_df = pd.DataFrame()
-        # Now creating a new dataframe of observed series from the forecast
-        # window
-        for date in date_range:
-            entry = site_var_df[site_var_df.datetime == date]
-            validation_df = pd.concat([validation_df, entry], 
-                                      axis=0).reset_index(drop=True)
-        
-        return validation_df[self.target_variable]
         
     def make_forecasts(self):
         """
         This function fits a Darts model to the training_set
         """
         print(self.hyperparams, self.model_likelihood)
+
+        # Stopping early
+        my_stopper = EarlyStopping(
+                monitor="val_loss",
+                patience=10,
+                min_delta=0.02,
+                mode='min',
+        )
+        pl_trainer_kwargs={"callbacks": [my_stopper]}
+        # And watching SMAPE
+        torch_metrics = SymmetricMeanAbsolutePercentageError()
         
         # Need to handle lags and time axis encoders
         self.hyperparams = self.prepare_hyperparams(self.hyperparams)
 
-        self.model = self.model_(**self.hyperparams,
-                                 output_chunk_length=self.forecast_horizon,
-                                 **self.model_likelihood,
-                                 random_state=self.seed)
-        self.scaler = Scaler()
-        extras = {"verbose": self.verbose,
-                  "epochs": self.epochs}
-        predict_kws = {"n": self.forecast_horizon,
-                       "num_samples": self.num_samples}
+        self.model = self.model_(
+            **self.hyperparams,
+            output_chunk_length=self.forecast_horizon,
+            **self.model_likelihood,
+            random_state=self.seed,
+            pl_trainer_kwargs=pl_trainer_kwargs,
+            torch_metrics=torch_metrics,
+        )
+        
+        extras = {
+            "verbose": self.verbose,
+            "epochs": self.epochs
+        }
+        predict_kws = {
+            "n": self.forecast_horizon,
+            "num_samples": self.num_samples
+        }
 
         # Need to account for models that don't use past covariates
+        self.scaler = Scaler()
         if self.covariates is not None:
-            # Changing to median so that I can use the time axis encoder.
-            # Darts does not allow inputs of mixed dimension.
-            training_set, covariates = self.scaler.fit_transform([self.training_set.median(),
-                                                                  self.covariates.median()])
+            self.scaler_cov = Scaler()
+            training_set = self.scaler.fit_transform(self.training_set)
+            covariates = self.scaler_cov.fit_transform(self.covs_train)
             extras["past_covariates"] = covariates
-            predict_kws["past_covariates"] = covariates
+            # Handling training and validation series + covariates differently
+            # because they were preprocessed separately
+            extras['val_series'] = self.get_validation_set(
+                self.scaler,
+                self.hyperparams['input_chunk_length']
+            )
+            extras["val_past_covariates"] = [
+                self.scaler_cov.transform(self.covariates) \
+                  for i in range(len(extras['val_series']))
+            ]
         else:
-            training_set = self.scaler.fit_transform(self.training_set.median())
+            training_set = self.scaler.fit_transform(self.training_set)
+            validation_set = self.get_validation_set(
+                self.scaler,
+                self.hyperparams['input_chunk_length']
+            )
+            extras["val_series"] = validation_set
 
         # Regression models don't accept these key word arguments for .fit()
         if self.model_ == XGBModel or self.model_ == LinearRegressionModel:
@@ -563,17 +827,35 @@ class BaseForecaster():
          " date. Note that the validation split date is defined to include the last" +\
          " date of the training set."
         
-        self.model.fit(training_set,
-                       **extras)
+        self.model.fit(training_set, **extras)
 
-        # Accounting for if there is dropout
+        # Preparing input series and covariates for the predictions
+        predict_series = self.get_predict_set(
+                self.scaler,
+                self.hyperparams['input_chunk_length']
+        )
+        if self.covariates is not None:
+            predict_kws['past_covariates'] = [
+                    self.scaler_cov.transform(self.covariates) \
+                      for i in range(len(predict_series))
+            ]
+
+        # Accounting for if there is dropout; Might delete this as this wasn't an interesting
+        # excursion
         if "dropout" in list(self.model_likelihood.keys()):
             predict_kws["mc_dropout"] = True
-            
-        predictions = self.model.predict(**predict_kws)
-        predictions = self.scaler.inverse_transform(predictions)
 
-        predictions.pd_dataframe().to_csv(self.output_csv_name)
+        predictions = self.model.predict( 
+            series=predict_series, 
+            **predict_kws
+        )
+        for prediction in predictions:
+            prediction = self.scaler.inverse_transform(prediction)
+            csv_name = self.output_csv_name + "_" + \
+                           prediction.time_index[0].strftime('%Y_%m_%d.csv')
+            prediction.pd_dataframe(suppress_warnings=True).to_csv(csv_name)
+            
+
 
     def get_historicals_and_residuals(self):
         """
@@ -581,11 +863,12 @@ class BaseForecaster():
         """
         # This presumes that the scaler will not have been modified in interim 
         # from calling `make_forecasts`
-        historical_forecast_kws = {"num_samples": self.num_samples,
-                                   "forecast_horizon": self.forecast_horizon,
-                                   "retrain": False,
-                                   "last_points_only": False,
-                                  }
+        historical_forecast_kws = {
+            "num_samples": self.num_samples,
+            "forecast_horizon": self.forecast_horizon,
+            "retrain": False,
+            "last_points_only": False,
+        }
         if self.covariates is not None:
             training_set, covariates = self.scaler.transform([self.training_set,
                                                               self.covariates])
@@ -602,16 +885,19 @@ class BaseForecaster():
                                                 historical_forecast in historical_forecasts]
         # Getting the target time series slice for the historical forecast
         self.historical_ground_truth = self.training_set.slice(
-                                            historical_forecasts[0].time_index[0], 
-                                            historical_forecasts[-1].time_index[-1])
+            historical_forecasts[0].time_index[0], 
+            historical_forecasts[-1].time_index[-1]
+        )
 
         # Now concatenating the historical forecasts which were returned
         # as a list above
         self.historical_forecasts = historical_forecasts[0]
         for time_series in historical_forecasts[1:]:
-            self.historical_forecasts = self.historical_forecasts.concatenate(time_series, 
-                                                                axis=0, 
-                                                                ignore_time_axis=True)
+            self.historical_forecasts = self.historical_forecasts.concatenate(
+                time_series, 
+                axis=0, 
+                ignore_time_axis=True
+            )
 
 
         # Defining residual as difference between the median and ground truth
@@ -777,5 +1063,5 @@ class ResidualForecaster():
                                   num_samples=self.num_samples)
         self.predictions = self.scaler.inverse_transform(predictions)
 
-        self.predictions.pd_dataframe().to_csv(self.output_csv_name)
+        self.predictions.pd_dataframe(suppress_warnings=True).to_csv(self.output_csv_name)
 
