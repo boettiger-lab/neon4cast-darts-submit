@@ -235,6 +235,11 @@ def modify_score_dict(csv, targets_df, target_variable, site_id, suffix, score_d
     return score_dict
 
 def plot_forecast(date, targets_df, site_id, target_variable, model_dir, plot_name=None):
+     '''
+    Returns a plot of the forecast specified by the date and model directory
+    in addition to the observed values, the climatology forecast and the naive persistence
+    forecast.
+    '''
     cmap = mpl.colormaps["tab10"]
     colors = cmap.colors
     # Loading the forecast csv and creating a time series
@@ -285,7 +290,10 @@ def plot_forecast(date, targets_df, site_id, target_variable, model_dir, plot_na
         plt.savefig(f"plots/{site_id}/{target_variable}/{plot_name}")
 
 def plot_crps_bydate(glob_prefix, targets_df, site_id, target_variable, suffix="", plot_name=None):
-
+    '''
+    Returns a strip plot of the crps scores for the inputted ML model and the climatology model at
+    each forecast window
+    '''
     plt.figure(figsize=(12, 8))
     score_dict = {}
     
