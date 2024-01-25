@@ -7,17 +7,17 @@ from darts.models import GaussianProcessFilter
 from darts import TimeSeries
 from sklearn.gaussian_process.kernels import RBF
 from darts.models import (
-                          BlockRNNModel, 
-                          TCNModel, 
-                          RNNModel, 
-                          TransformerModel, 
-                          NLinearModel,
-                          DLinearModel,
-                          NBEATSModel,
-                          XGBModel,
-                          LinearRegressionModel,
-                          TFTModel,
-                         )
+    BlockRNNModel, 
+    TCNModel, 
+    RNNModel, 
+    TransformerModel, 
+    NLinearModel,
+    DLinearModel,
+    NBEATSModel,
+    XGBModel,
+    LinearRegressionModel,
+    TFTModel,
+)
 from darts.utils.likelihood_models import QuantileRegression
 from darts.dataprocessing.transformers import Scaler
 from darts.metrics import smape
@@ -33,8 +33,6 @@ import numpy as np
 from torchmetrics import SymmetricMeanAbsolutePercentageError
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 import warnings
-
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 def crps(forecast, observed, observed_is_ts=False):
     """
@@ -58,6 +56,46 @@ def crps(forecast, observed, observed_is_ts=False):
     
     return crps_scores
 
+class NaivePersistenceForecaster():
+    def __init__(self,
+                 targets: Optional = None,
+                 site_id: Optional[str] = None,
+                 target_variable: Optional[str] = "oxygen",
+                 output_csv_name: Optional[str] = "historical_forecaster_output.csv", # This is not used
+                 forecast_horizon: Optional[int] = 30,
+                 validation_split_date: Optional[str] = "2023-03-09",
+                 ):
+        self.targets = targets.loc[targets.site_id == site_id]
+        # Changing the date from a string to a datetime64 object
+        column_name = 'datetime'
+        column_index = self.targets.columns.get_loc(column_name)
+        self.targets[self.targets.columns[column_index]] = pd.to_datetime(
+            self.targets[column_name]
+        )
+        self.target_variable = target_variable
+        self.output_csv_name = output_csv_name
+        self.forecast_horizon = forecast_horizon
+        self.validation_split_date = validation_split_date
+        self.site_id = site_id
+
+    def make_forecasts(self):
+        forecast_doys = pd.date_range(
+            start=self.validation_split_date, 
+            periods=self.forecast_horizon, 
+            freq='D',
+        )
+        # Filter the targets to only look at timestamps before the split date
+        date = pd.to_datetime(self.validation_split_date)
+        filtered_targets = self.targets.loc[self.targets.datetime < date]
+        # Select the last observed target value is selected
+        last_row = (
+            filtered_targets[filtered_targets[self.target_variable].notna()]
+            .iloc[-1]
+        )
+        last_target_value = last_row[self.target_variable]
+        # Create a TimeSeries with this value for each day of the forecast window
+        values = np.array([last_target_value for doy in forecast_doys])
+        self.forecast_ts = TimeSeries.from_times_and_values(forecast_doys, values)
 
 class HistoricalForecaster():
     def __init__(self,
@@ -83,10 +121,12 @@ class HistoricalForecaster():
     def _preprocess_data(self):
         # Doing some basic filtering and tidying
         site_df = self.targets.loc[self.targets.site_id == self.site_id]
-        tidy_df = pd.melt(site_df, 
-                          id_vars=['datetime', 'site_id'], 
-                          var_name='variable', 
-                          value_name='observation')
+        tidy_df = pd.melt(
+            site_df, 
+            id_vars=['datetime', 'site_id'], 
+            var_name='variable', 
+            value_name='observation'
+        )
         variable_df = tidy_df.loc[tidy_df.variable == self.target_variable]
         # Cutting off before the validation split date
         split_date = pd.to_datetime(self.validation_split_date)
@@ -170,14 +210,18 @@ class HistoricalForecaster():
         # the observed value
         for date in self.training_set.time_index:
             doy = date.dayofyear
-            observed = self.training_set.slice_n_points_after(date, 
-                                                              1).median().values()[0][0]
+            observed = self.training_set.slice_n_points_after(
+                date, 
+                1
+            ).median().values()[0][0]
             historical_mean = self.doy_df.loc[doy]["mean"]
             residual = observed - historical_mean
             residual_list.append(residual)
 
-        self.residuals = TimeSeries.from_times_and_values(self.training_set.time_index, 
-                                                          residual_list)
+        self.residuals = TimeSeries.from_times_and_values(
+            self.training_set.time_index, 
+            residual_list
+        )
         
 def month_doy_range(year, month):
     # Get the first day of the month
@@ -260,16 +304,20 @@ class TimeSeriesPreprocessor():
         """
         kernel = RBF()
         
-        gpf_missing = GaussianProcessFilter(kernel=kernel, 
-                        alpha=self.filter_kw_args["alpha_0"], 
-                        n_restarts_optimizer=self.filter_kw_args["n_restarts_0"])
+        gpf_missing = GaussianProcessFilter(
+            kernel=kernel, 
+            alpha=self.filter_kw_args["alpha_0"], 
+            n_restarts_optimizer=self.filter_kw_args["n_restarts_0"]
+        )
         
         stitched_series = {}
     
         # Filtering the TimeSeries
         try:
-            filtered = gpf_missing.filter(self.var_tseries_dict[var], 
-                                          num_samples=self.filter_kw_args["num_samples"])
+            filtered = gpf_missing.filter(
+                self.var_tseries_dict[var], 
+                num_samples=self.filter_kw_args["num_samples"]
+            )
         except:
             return None
     
