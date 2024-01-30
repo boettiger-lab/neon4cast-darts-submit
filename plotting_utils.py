@@ -287,8 +287,8 @@ def modify_score_dict(csv, targets_df, target_variable, site_id, suffix, score_d
 def score_improvement_bysite(model, targets_df, target_variable, suffix="", plot_name=None):
     '''
     This function collects the forecast scores for the specifed model and target variable.
-    Then it returns a dataframe with columns for the percent improvement in CRPS and RMSE
-    over the historical and naive persistence null model (note that the naive will only be RMSE).
+    Then it returns a dataframe with columns for the difference in CRPS and RMSE
+    compared to the historical and naive persistence null model (note that the naive will only be RMSE).
     '''
     score_dict = {}
     # For each site, score CRPS and RMSE individually and add to score_dict
@@ -344,40 +344,21 @@ def score_improvement_bysite(model, targets_df, target_variable, suffix="", plot
         naive_df, 
         on=['site_id', 'date', 'metric'], 
     )
-    # Need to finish things up here, basically repeat the below but with the now two dataframes for crps and rmse
     # Calculate percent improvement for each metric
-    crps_merged['percent_improvement_historical_crps'] = (
-        (crps_merged['value_historical'] - crps_merged['value_forecast']) /
-        crps_merged['value_historical']
-    ) * 100
+    crps_merged['difference_historical_ml_crps'] = -(
+        crps_merged['value_historical'] - crps_merged['value_forecast']
+    )
     
-    rmse_merged['percent_improvement_historical_rmse'] = (
-        (rmse_merged['value_historical'] - rmse_merged['value_forecast']) /
-        rmse_merged['value_historical']
-    ) * 100
+    rmse_merged['difference_historical_ml_rmse'] = -(
+        rmse_merged['value_historical'] - rmse_merged['value_forecast']
+    ) 
     
-    rmse_merged['percent_improvement_naive_rmse'] = (
-        (rmse_merged['value_naive'] - rmse_merged['value_forecast']) /
-        rmse_merged['value_naive']
-    ) * 100
+    rmse_merged['difference_naive_ml_rmse'] = -(
+        rmse_merged['value_naive'] - rmse_merged['value_forecast']
+    )
 
-    rmse_merged['percent_improvement_nh_rmse'] = (
-        (rmse_merged['value_naive'] - rmse_merged['value_historical']) /
-        rmse_merged['value_naive']
-    ) * 100
-
-    # Finding the amount of windows where the mean crps or rmse has a positive improvement
-    crps_merged['positive_improvement_historical_crps'] = (
-        crps_merged['percent_improvement_historical_crps'] > 0
-    )
-    rmse_merged['positive_improvement_historical_rmse'] = (
-       rmse_merged['percent_improvement_historical_rmse'] > 0 
-    )
-    rmse_merged['positive_improvement_naive_rmse'] = (
-        rmse_merged['percent_improvement_naive_rmse'] > 0
-    )
-    rmse_merged['positive_improvement_nh_rmse'] = (
-        rmse_merged['percent_improvement_nh_rmse'] > 0
+    rmse_merged['difference_naive_historical_rmse'] = -(
+        rmse_merged['value_naive'] - rmse_merged['value_historical']
     )
 
     # Deleting unnecessary columns
@@ -390,11 +371,8 @@ def score_improvement_bysite(model, targets_df, target_variable, suffix="", plot
     # for comparison against the climatology model
     merged_df = pd.merge(crps_merged, rmse_merged, on=['site_id', 'date'], how='inner')
     merged_df = merged_df.drop(merged_df.filter(like='metric').columns, axis=1)
-    merged_df['combined_improvement_historical'] = (
-       merged_df['positive_improvement_historical_crps'] &  merged_df['positive_improvement_historical_rmse']
-    )
     merged_df['model'] = model
-    
+
     return merged_df
     
 def plot_forecast(date, targets_df, site_id, target_variable, model_dir, plot_name=None):
@@ -523,23 +501,15 @@ def plot_crps_bydate(glob_prefix, targets_df, site_id, target_variable, suffix="
 
 def plot_improvement_bysite(score_df, metadata_df, title_name, historical=True):
     '''
-    Returns a plot of the percent of metric improvement vs. the site id;
-    site type is encoded by point shape, and whether the percentage is above 50%
-    or not is encoded by color.
+    Returns a plot of the scoring metric difference vs. the site id;
+    site type is encoded by color.
     '''
     ## Find the percentage of forecast windows during which the ML model excelled 
     ## the historical forecaster
     column = (
-        'combined_improvement_historical' if historical \
-         else 'positive_improvement_naive_rmse'
-    )    
-    score_df = score_df[['site_id', column]].groupby(['site_id']).mean() * 100
-    score_df.reset_index(inplace=True)
-    ## Rename the 'combined_improvement' column to 'combined_improvement_percentage'
-    score_df.rename(columns={column: 'improvement_percentage'}, inplace=True)
-
-    ## Marking the sites at which 
-    score_df['above_50'] = score_df['improvement_percentage'] > 50
+        'difference_historical_ml_crps' if historical \
+         else 'difference_naive_ml_rmse'
+    )
 
     # Combining df's to include metadata
     df = pd.merge(
@@ -550,62 +520,61 @@ def plot_improvement_bysite(score_df, metadata_df, title_name, historical=True):
     ).drop(columns=['field_site_id'])
     
     plt.figure(figsize=(12, 8))
-    custom_palette = {True: 'tab:blue', False: 'indianred'}
-    markers = {'Wadeable Stream': 's', 'Lake': 'o', 'Non-wadeable River': '^'}
+    color_dict = {
+        'Wadeable Stream': 'tab:blue', 
+        'Lake': 'indianred', 
+        'Non-wadeable River': 'plum'
+    }
 
     for site_type in ['Wadeable Stream', 'Lake', 'Non-wadeable River']:
-        
-        sns.pointplot(
+        sns.boxplot(
             data=df.loc[df.field_site_subtype == site_type],
             x='site_id',
-            y='improvement_percentage',
-            linestyle='',
-            hue='above_50',
-            palette=custom_palette,
-            markers=markers[site_type],
+            y=column,
+            color=color_dict[site_type],
+            showfliers=False,
         )
 
     plt.grid(False)
-    comparison_model = "Historical" if historical else "Naive"
-    plt.ylabel(f"% of CRPS and RMSE Improvement over {comparison_model}")
+    plt.axhline(y=0, color='black', linestyle='dashed', linewidth=1)
+    if historical:
+        plt.ylabel(f"CRPS(Model) - CRPS(Climatology) ")
+    else:
+        plt.ylabel(f"RMSE(Model) - RMSE(Naive Persistence) ")
     ax = plt.gca()
     ax.spines["left"].set_visible(True)
     ax.spines["bottom"].set_visible(True)
     plt.xticks(rotation=30)
-    plt.legend(labels=[])
+    legend_handles = [Patch(facecolor=color, edgecolor='black') for color in color_dict.values()]
+    legend_labels = list(color_dict.keys())
+    plt.legend(legend_handles, legend_labels, title='Site Type', loc='upper right')
+    plt.tight_layout()
     plt.title(title_name)
 
 def plot_global_percentages(df_, title_name, historical=True):
     '''
-    Returns a plot of the percent of metric improvement vs. model type
+    Returns a plot of the scoring metric difference vs. ML model type
     '''
     plt.figure(figsize=(12, 8))
-    custom_palette = {True: 'tab:blue', False: 'indianred'}
     column = (
-        'combined_improvement_historical' if historical \
-         else 'positive_improvement_naive_rmse'
-    )   
-    global_percentages = df_[['model', column]].groupby(['model']).mean() * 100
-    global_percentages.reset_index(inplace=True)
-    global_percentages.rename(
-        columns={column: 'combined_improvement_percentage'}, 
-        inplace=True
-    )
+        'difference_historical_ml_crps' if historical \
+         else 'difference_naive_ml_rmse'
+    ) 
 
-    # Marking the sites at which 
-    global_percentages['above_50'] = global_percentages['combined_improvement_percentage'] > 50
-    sns.pointplot(
-        data=global_percentages,
+    sns.boxplot(
+        data=df_,
         x='model',
-        y='combined_improvement_percentage',
-        linestyle='',
-        hue='above_50',
-        palette=custom_palette,
+        y=column,
+        showfliers=False,
+        color='tab:blue'
     )
 
     plt.grid(False)
-    comparison_model = "Historical" if historical else "Naive"
-    plt.ylabel(f"% of CRPS and RMSE Improvement over {comparison_model}")
+    plt.axhline(y=0, color='black', linestyle='dashed', linewidth=1)
+    if historical:
+        plt.ylabel(f"CRPS(Model) - CRPS(Climatology) ")
+    else:
+        plt.ylabel(f"RMSE(Model) - RMSE(Naive Persistence) ")
     ax = plt.gca()
     ax.spines["left"].set_visible(True)
     ax.spines["bottom"].set_visible(True)
@@ -615,10 +584,14 @@ def plot_global_percentages(df_, title_name, historical=True):
 
 def plot_site_type_percentages_global(df_, metadata_df, title_name, historical=True):
     '''
-    Returns a plot of the percent of metric improvement vs. water body type
+    Returns a plot of the scoring metric difference vs. water body type.
     '''
     plt.figure(figsize=(12, 8))
-    custom_palette = {True: 'tab:blue', False: 'indianred'}
+    color_dict = {
+        'Wadeable Stream': 'tab:blue', 
+        'Lake': 'indianred', 
+        'Non-wadeable River': 'plum'
+    }
 
     # Combining df's to include metadata
     df = pd.merge(
@@ -629,30 +602,25 @@ def plot_site_type_percentages_global(df_, metadata_df, title_name, historical=T
     ).drop(columns=['field_site_id'])
 
     column = (
-        'combined_improvement_historical' if historical \
-         else 'positive_improvement_naive_rmse'
-    )   
-    results = df[[column, 'field_site_subtype']].groupby(['field_site_subtype']).mean() * 100
-    results.reset_index(inplace=True)
-    results.rename(
-        columns={column: 'combined_improvement_percentage'}, 
-        inplace=True
-    )
+        'difference_historical_ml_crps' if historical \
+         else 'difference_naive_ml_rmse'
+    ) 
 
-    # Marking the sites at which 
-    results['above_50'] = results['combined_improvement_percentage'] > 50
-    sns.pointplot(
-        data=results,
+    sns.boxplot(
+        data=df,
         x='field_site_subtype',
-        y='combined_improvement_percentage',
-        linestyle='',
-        hue='above_50',
-        palette=custom_palette,
+        hue='field_site_subtype',
+        y=column,
+        showfliers=False,
+        palette=color_dict,
     )
 
     plt.grid(False)
-    comparison_model = "Historical" if historical else "Naive"
-    plt.ylabel(f"% of CRPS and RMSE Improvement over {comparison_model}")
+    plt.axhline(y=0, color='black', linestyle='dashed', linewidth=1)
+    if historical:
+        plt.ylabel(f"CRPS(ML Model) - CRPS(Climatology Model) ")
+    else:
+        plt.ylabel(f"RMSE(ML Model) - RMSE(Naive Persistence) ")
     ax = plt.gca()
     ax.spines["left"].set_visible(True)
     ax.spines["bottom"].set_visible(True)
@@ -662,12 +630,15 @@ def plot_site_type_percentages_global(df_, metadata_df, title_name, historical=T
 
 def plot_site_type_percentages_bymodel(df_, metadata_df, title_name, historical=True):
     '''
-    Returns a plot of the percent of metric improvement vs. model type;
-    site type is encoded by point shape
+    Returns a plot of the scoring metric difference vs. model type;
+    site type is encoded by color
     '''
     plt.figure(figsize=(12, 8))
-    custom_palette = {True: 'tab:blue', False: 'indianred'}
-    markers = {'Wadeable Stream': 's', 'Lake': 'o', 'Non-wadeable River': '^'}
+    color_dict = {
+        'Wadeable Stream': 'tab:blue', 
+        'Lake': 'indianred', 
+        'Non-wadeable River': 'plum'
+    }
 
     # Combining df's to include metadata
     df = pd.merge(
@@ -678,61 +649,47 @@ def plot_site_type_percentages_bymodel(df_, metadata_df, title_name, historical=
     ).drop(columns=['field_site_id'])
 
     column = (
-        'combined_improvement_historical' if historical \
-         else 'positive_improvement_naive_rmse'
-    )   
-    results = df[[
-        column, 
-        'field_site_subtype', 
-        'model'
-    ]].groupby(['field_site_subtype', 'model']).mean() * 100
-    
-    results.reset_index(inplace=True)
-    results.rename(
-        columns={column: 'combined_improvement_percentage'}, 
-        inplace=True
+        'difference_historical_ml_crps' if historical \
+         else 'difference_naive_ml_rmse'
+    ) 
+
+    sns.boxplot(
+        data=df,
+        x='model',
+        hue='field_site_subtype',
+        y=column,
+        showfliers=False,
+        dodge=True,
+        palette=color_dict,
     )
 
-    # Marking the sites at which 
-    results['above_50'] = results['combined_improvement_percentage'] > 50
-
-    for site_type in ['Wadeable Stream', 'Lake', 'Non-wadeable River']:
-        sns.pointplot(
-            data=results.loc[results.field_site_subtype == site_type],
-            x='model',
-            y='combined_improvement_percentage',
-            linestyle='',
-            hue='above_50',
-            palette=custom_palette,
-            markers=markers[site_type],
-        )
-
     plt.grid(False)
-    comparison_model = "Historical" if historical else "Naive"
-    plt.ylabel(f"% of CRPS and RMSE Improvement over {comparison_model}")
+    plt.axhline(y=0, color='black', linestyle='dashed', linewidth=1)
+    if historical:
+        plt.ylabel(f"CRPS(Model) - CRPS(Climatology) ")
+    else:
+        plt.ylabel(f"RMSE(Model) - RMSE(Naive Persistence) ")
     ax = plt.gca()
     ax.spines["left"].set_visible(True)
     ax.spines["bottom"].set_visible(True)
     plt.xticks(rotation=30)
+    legend_handles = [Patch(facecolor=color, edgecolor='black') for color in color_dict.values()]
+    legend_labels = list(color_dict.keys())
+    plt.legend(legend_handles, legend_labels, title='Site Type', loc='upper right')
+    plt.tight_layout()
     plt.title(title_name)
-    # Create your custom legend elements
-    triangle = Line2D([0], [0], marker='^', color='w', markerfacecolor='grey', markersize=8, label='Non-wadeable River')
-    circle = Line2D([0], [0], marker='o', color='w', markerfacecolor='grey', markersize=8, label='Lake')
-    square = Line2D([0], [0], marker='s', color='w', markerfacecolor='grey', markersize=8, label='Wadeable Stream')
-    
-    # Create a custom legend
-    legend_elements = [triangle, circle, square]
-    plt.legend(labels=[])
-    ax.legend(handles=legend_elements, loc='upper right')
 
 def plot_window_and_sitetype_performance(model_df, metadata_df, title_name, historical=True):
     '''
-    Returns a plot of the percent of metric improvement vs. forecast windows;
-    site type is encoded by point shape
+    Returns a plot of the difference in scoring metric vs. forecast windows;
+    site type is encoded by color
     '''
     plt.figure(figsize=(12, 8))
-    custom_palette = {True: 'tab:blue', False: 'indianred'}
-    markers = {'Wadeable Stream': 's', 'Lake': 'o', 'Non-wadeable River': '^'}
+    color_dict = {
+        'Wadeable Stream': 'tab:blue', 
+        'Lake': 'indianred', 
+        'Non-wadeable River': 'plum'
+    }
 
     # Combining df's to include metadata
     df = pd.merge(
@@ -743,61 +700,49 @@ def plot_window_and_sitetype_performance(model_df, metadata_df, title_name, hist
     ).drop(columns=['field_site_id'])
 
     column = (
-        'combined_improvement_historical' if historical \
-         else 'positive_improvement_naive_rmse'
-    )   
-    results = df[[
-        column, 
-        'field_site_subtype',
-        'date'
-    ]].groupby(['field_site_subtype', 'date']).mean() * 100
-    
-    results.reset_index(inplace=True)
-    results.rename(
-        columns={column: 'combined_improvement_percentage'}, 
-        inplace=True
+        'difference_historical_ml_crps' if historical \
+         else 'difference_naive_ml_rmse'
+    ) 
+
+    sns.boxplot(
+        data=df,
+        x='date',
+        y=column,
+        hue='field_site_subtype',
+        palette=color_dict,
+        dodge=True,
+        showfliers=False,
     )
 
-    # Marking the sites at which 
-    results['above_50'] = results['combined_improvement_percentage'] > 50
-
-    for site_type in ['Wadeable Stream', 'Lake', 'Non-wadeable River']:
-        sns.pointplot(
-            data=results.loc[results.field_site_subtype == site_type],
-            x='date',
-            y='combined_improvement_percentage',
-            linestyle='',
-            hue='above_50',
-            palette=custom_palette,
-            markers=markers[site_type],
-        )
-
     plt.grid(False)
-    comparison_model = "Historical" if historical else "Naive"
-    plt.ylabel(f"% of CRPS and RMSE Improvement over {comparison_model}")
+    plt.axhline(y=0, color='black', linestyle='dashed', linewidth=1)
+    if historical:
+        plt.ylabel(f"CRPS(Model) - CRPS(Climatology) ")
+    else:
+        plt.ylabel(f"RMSE(Model) - RMSE(Naive Persistence) ")
     ax = plt.gca()
     ax.spines["left"].set_visible(True)
     ax.spines["bottom"].set_visible(True)
     plt.xticks(rotation=30)
+    legend_handles = [
+        Patch(facecolor=color, edgecolor='black') for color in color_dict.values()
+    ]
+    legend_labels = list(color_dict.keys())
+    plt.legend(legend_handles, legend_labels, title='Site Type', loc='upper right')
+    plt.tight_layout()
     plt.title(title_name)
-    # Create your custom legend elements
-    triangle = Line2D([0], [0], marker='^', color='w', markerfacecolor='grey', markersize=8, label='Non-wadeable River')
-    circle = Line2D([0], [0], marker='o', color='w', markerfacecolor='grey', markersize=8, label='Lake')
-    square = Line2D([0], [0], marker='s', color='w', markerfacecolor='grey', markersize=8, label='Wadeable Stream')
-    
-    # Create a custom legend
-    legend_elements = [triangle, circle, square]
-    plt.legend(labels=[])
-    ax.legend(handles=legend_elements, loc='upper right')
 
 def plot_region_percentages(df_, metadata_df, title_name, historical=True):
     '''
-    Returns a plot of the percent of metric improvement vs. the geographical regions;
-    site type is encoded by point shape
+    Returns a plot of the difference in scoring metric vs. the geographical regions;
+    site type is encoded by color
     '''
     plt.figure(figsize=(12, 8))
-    custom_palette = {True: 'tab:blue', False: 'indianred'}
-    markers = {'Wadeable Stream': 's', 'Lake': 'o', 'Non-wadeable River': '^'}
+    color_dict = {
+        'Wadeable Stream': 'tab:blue', 
+        'Lake': 'indianred', 
+        'Non-wadeable River': 'plum'
+    }
 
     # Combining df's to include metadata
     df = pd.merge(
@@ -808,50 +753,35 @@ def plot_region_percentages(df_, metadata_df, title_name, historical=True):
     ).drop(columns=['field_site_id'])
 
     column = (
-        'combined_improvement_historical' if historical \
-         else 'positive_improvement_naive_rmse'
-    )   
-    results = df[[
-        column, 
-        'region',
-        'field_site_subtype'
-    ]].groupby(['field_site_subtype', 'region']).mean() * 100
+        'difference_historical_ml_crps' if historical \
+         else 'difference_naive_ml_rmse'
+    ) 
     
-    results.reset_index(inplace=True)
-    results.rename(
-        columns={column: 'combined_improvement_percentage'}, 
-        inplace=True
+    sns.boxplot(
+            data=df,
+            x='region',
+            y=column,
+            hue='field_site_subtype',
+            palette=color_dict,
+            showfliers=False,
+            dodge=True,
     )
 
-    # Marking the sites at which 
-    results['above_50'] = results['combined_improvement_percentage'] > 50
-
-    for site_type in ['Wadeable Stream', 'Lake', 'Non-wadeable River']:
-        sns.pointplot(
-            data=results.loc[results.field_site_subtype == site_type],
-            x='region',
-            y='combined_improvement_percentage',
-            linestyle='',
-            hue='above_50',
-            palette=custom_palette,
-            markers=markers[site_type],
-        )
-
     plt.grid(False)
-    comparison_model = "Historical" if historical else "Naive"
-    plt.ylabel(f"% of CRPS and RMSE Improvement over {comparison_model}")
+    plt.axhline(y=0, color='black', linestyle='dashed', linewidth=1)
+    if historical:
+        plt.ylabel(f"CRPS(Model) - CRPS(Climatology) ")
+    else:
+        plt.ylabel(f"RMSE(Model) - RMSE(Naive Persistence) ")
     ax = plt.gca()
     ax.spines["left"].set_visible(True)
     ax.spines["bottom"].set_visible(True)
     plt.xticks(rotation=30)
+    legend_handles = [
+        Patch(facecolor=color, edgecolor='black') for color in color_dict.values()
+    ]
+    legend_labels = list(color_dict.keys())
+    plt.legend(legend_handles, legend_labels, title='Site Type', loc='upper right')
+    plt.tight_layout()
     plt.title(title_name)
-    # Create your custom legend elements
-    triangle = Line2D([0], [0], marker='^', color='w', markerfacecolor='grey', markersize=8, label='Non-wadeable River')
-    circle = Line2D([0], [0], marker='o', color='w', markerfacecolor='grey', markersize=8, label='Lake')
-    square = Line2D([0], [0], marker='s', color='w', markerfacecolor='grey', markersize=8, label='Wadeable Stream')
-    
-    # Create a custom legend
-    legend_elements = [triangle, circle, square]
-    plt.legend(labels=[])
-    ax.legend(handles=legend_elements, loc='upper right')
 
