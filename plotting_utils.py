@@ -19,6 +19,7 @@ import CRPS.CRPS as forecastscore
 from darts.metrics import rmse
 import matplotlib as mpl
 from sklearn.cluster import KMeans
+from datetime import datetime
 
 pd.options.mode.chained_assignment = None
 
@@ -118,7 +119,7 @@ def filter_forecast_df(forecast_df, validation_series):
         times, 
         values,
         fill_missing_dates=True,
-        freq='D'
+        freq="D",
     )
 
     return filtered_forecast_ts, validation_series
@@ -133,6 +134,7 @@ def make_df_from_score_dict(score_dict):
     metric_list = []
     model_list = []
     value_list = []
+    t_list = []
     
     # Iterate through the dictionary and extract data
     for site_id, dates in score_dict.items():
@@ -142,17 +144,18 @@ def make_df_from_score_dict(score_dict):
             rmse_forecast = values['rmse_forecast']
             rmse_historical = values['rmse_historical']
             rmse_naive = values['rmse_naive']
+            ts = values['t']
     
             entries = [
-                (site_id, date, 'crps', 'forecast', forecast_crps_val)
-                for forecast_crps_val in crps_forecast_array
+                (site_id, date, 'crps', 'forecast', forecast_crps_val, ts[i])
+                for i, forecast_crps_val in enumerate(crps_forecast_array)
             ] + [
-                (site_id, date, 'crps', 'historical', historical_crps_val)
-                for historical_crps_val in crps_historical_array
+                (site_id, date, 'crps', 'historical', historical_crps_val, ts[i])
+                for i, historical_crps_val in enumerate(crps_historical_array)
             ] + [
-                (site_id, date, 'rmse', 'forecast', rmse_forecast),
-                (site_id, date, 'rmse', 'historical', rmse_historical),
-                (site_id, date, 'rmse', 'naive', rmse_naive)
+                (site_id, date, 'rmse', 'forecast', rmse_forecast, np.nan),
+                (site_id, date, 'rmse', 'historical', rmse_historical, np.nan),
+                (site_id, date, 'rmse', 'naive', rmse_naive, np.nan)
             ]
     
             # Extend the lists with the generated entries
@@ -161,6 +164,7 @@ def make_df_from_score_dict(score_dict):
             metric_list.extend([entry[2] for entry in entries])
             model_list.extend([entry[3] for entry in entries])
             value_list.extend([entry[4] for entry in entries])
+            t_list.extend([entry[5] for entry in entries])
     
     # Create a DataFrame
     df = pd.DataFrame({
@@ -168,7 +172,8 @@ def make_df_from_score_dict(score_dict):
         'date': date_list,
         'metric': metric_list,
         'model': model_list,
-        'value': value_list
+        'value': value_list,
+        't': t_list,
     })
     
     return df
@@ -218,7 +223,7 @@ def modify_score_dict(csv, targets_df, target_variable, site_id, suffix, score_d
         filtered_validation_series.index, 
         filtered_validation_series.values, 
         fill_missing_dates=True,
-        freq='D'
+        freq="D",
     )
 
     rmse_score = rmse(filtered_validation_ts, filtered_model_forecast)
@@ -229,7 +234,10 @@ def modify_score_dict(csv, targets_df, target_variable, site_id, suffix, score_d
         filtered_validation_ts,
         observed_is_ts=True,
     )
-    score_dict[time_str]["crps_forecast"] = crps_scores.pd_dataframe().values[:, 0]
+    crps_forecast = crps_scores.pd_dataframe().values[:, 0]
+    score_dict[time_str]["crps_forecast"] = (
+        crps_forecast[~np.isnan(crps_forecast)]
+    )
 
     # Instantiating the null models which includes a daily historical and a naive
     # persistence model
@@ -280,11 +288,22 @@ def modify_score_dict(csv, targets_df, target_variable, site_id, suffix, score_d
     
     score_dict[time_str]["rmse_historical"] = rmse_scores[0]
     score_dict[time_str]["rmse_naive"] = rmse_scores[1]
-    score_dict[time_str]["crps_historical"] = crps_scores.pd_dataframe().values[:, 0]
+    crps_historical = crps_scores.pd_dataframe().values[:, 0]
+    score_dict[time_str]["crps_historical"] = (
+        crps_historical[~np.isnan(crps_historical)]
+    )
+
+    # Convert the first date to a datetime object
+    index = filtered_validation_series.index
+
+    # Enumerating days after the start date
+    days_after_start = [(date - times[0]).days + 1 for date in index]
+    score_dict[time_str]["t"] = days_after_start
+    assert(len(score_dict[time_str]["t"]) == len(score_dict[time_str]["crps_forecast"]))
     
     return score_dict
 
-def score_improvement_bysite(model, targets_df, target_variable, suffix="", plot_name=None):
+def score_improvement_bysite(model, targets_df, target_variable, suffix=""):
     '''
     This function collects the forecast scores for the specifed model and target variable.
     Then it returns a dataframe with columns for the difference in CRPS and RMSE
@@ -310,18 +329,34 @@ def score_improvement_bysite(model, targets_df, target_variable, suffix="", plot
     # Producing a dataframe from the score dictionary, as df's are easier
     # to manipulate
     df = make_df_from_score_dict(score_dict)
+    # Making dataframes to look at within and between forecast windows
+    intra_df = df.loc[df.metric == 'crps']
+    inter_df = df.drop('t', axis=1)
+    
+    # Looking within a forecast window
+    # Filtering dataframe for forecast and historical data separately
+    forecast_df = intra_df[intra_df['model'] == 'forecast']
+    historical_df = intra_df[intra_df['model'] == 'historical']
+    
+    # Merging forecast and historical data on site_id, date, and t
+    intra_merged = pd.merge(forecast_df, historical_df, on=['site_id', 'date', 't'], suffixes=('_forecast', '_historical'))
+
+    # Finding the difference between the historical and ml model crps
+    intra_merged['value_difference'] = intra_merged['value_forecast'] - intra_merged['value_historical']
+    intra_merged = intra_merged[['site_id', 'date', 't', 'value_difference']]
+    intra_merged['model'] = model
 
     # Using the mean CRPS score over the forecast horizon
-    df = df.groupby(['site_id', 'date', 'metric', 'model']).mean().reset_index()
+    inter_df = inter_df.groupby(['site_id', 'date', 'metric', 'model']).mean().reset_index()
 
     # Creating a CRPS and RMSE dataframe separately which is definitely
     # not the most elegant solution here
-    crps_df = df[df['metric'] == 'crps']
-    rmse_df = df[df['metric'] == 'rmse']
+    crps_df = inter_df[inter_df['metric'] == 'crps']
+    rmse_df = inter_df[inter_df['metric'] == 'rmse']
     
     forecast_dfs = [df_[df_['model'] == 'forecast'] for df_ in [crps_df, rmse_df]]
     historical_dfs = [df_[df_['model'] == 'historical'] for df_ in [crps_df, rmse_df]]
-    naive_df = df[df['model'] == 'naive']
+    naive_df = inter_df[inter_df['model'] == 'naive']
     naive_df = naive_df.rename(columns={'value': 'value_naive'})
 
     # Merge the two DataFrames on site_id, date, and metric
@@ -345,20 +380,20 @@ def score_improvement_bysite(model, targets_df, target_variable, suffix="", plot
         on=['site_id', 'date', 'metric'], 
     )
     # Calculate percent improvement for each metric
-    crps_merged['difference_historical_ml_crps'] = -(
-        crps_merged['value_historical'] - crps_merged['value_forecast']
+    crps_merged['difference_historical_ml_crps'] = (
+        crps_merged['value_forecast'] - crps_merged['value_historical']
     )
     
-    rmse_merged['difference_historical_ml_rmse'] = -(
-        rmse_merged['value_historical'] - rmse_merged['value_forecast']
+    rmse_merged['difference_historical_ml_rmse'] = (
+        rmse_merged['value_forecast'] - rmse_merged['value_historical'] 
     ) 
     
-    rmse_merged['difference_naive_ml_rmse'] = -(
-        rmse_merged['value_naive'] - rmse_merged['value_forecast']
+    rmse_merged['difference_naive_ml_rmse'] = (
+        rmse_merged['value_forecast'] - rmse_merged['value_naive'] 
     )
 
-    rmse_merged['difference_naive_historical_rmse'] = -(
-        rmse_merged['value_naive'] - rmse_merged['value_historical']
+    rmse_merged['difference_naive_historical_rmse'] = (
+        rmse_merged['value_historical'] - rmse_merged['value_naive']
     )
 
     # Deleting unnecessary columns
@@ -373,7 +408,7 @@ def score_improvement_bysite(model, targets_df, target_variable, suffix="", plot
     merged_df = merged_df.drop(merged_df.filter(like='metric').columns, axis=1)
     merged_df['model'] = model
 
-    return merged_df
+    return merged_df, intra_merged
     
 def plot_forecast(date, targets_df, site_id, target_variable, model_dir, plot_name=None):
     '''
@@ -785,3 +820,42 @@ def plot_region_percentages(df_, metadata_df, title_name, historical=True):
     plt.tight_layout()
     plt.title(title_name)
 
+def plot_crps_over_time_agg(intra_df, title_name):
+    plt.figure(figsize=(12, 8))
+
+    # Group by 't' and 'model' and calculate the mean and percentiles
+    summary_df = intra_df.groupby(['t'])['value_difference'].agg([lambda x: x.quantile(0.05),
+                                                                  lambda x: x.quantile(0.5),
+                                                                  lambda x: x.quantile(0.95)]).reset_index()
+    
+    # Rename the columns for better clarity
+    summary_df.columns = ['t', '5th_percentile', '50th_percentile', '95th_percentile']
+    
+    # Plot shaded regions for percentiles
+    plt.fill_between(
+        summary_df['t'],
+        summary_df['5th_percentile'],
+        summary_df['95th_percentile'],
+        alpha=0.2,
+        color='#1f77b4',
+    )
+    
+    # Plot the median line separately to avoid shading it
+    sns.lineplot(
+        data=summary_df,
+        x='t',
+        y='50th_percentile',
+        legend=False,
+        color='#1f77b4',
+    )
+    
+    # Customize plot appearance
+    plt.grid(False)
+    ax = plt.gca()
+    ax.spines["left"].set_visible(True)
+    ax.spines["bottom"].set_visible(True)
+    plt.axhline(y=0, color='black', linestyle='dashed', linewidth=1)
+    plt.legend(labels=['ML Model Aggregate'])
+    plt.ylabel("CRPS(ML Model) - CRPS(Climatology Model)")
+    plt.title(title_name)
+    plt.show()
