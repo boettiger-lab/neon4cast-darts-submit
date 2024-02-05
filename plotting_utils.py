@@ -141,6 +141,8 @@ def make_df_from_score_dict(score_dict):
         for date, values in dates.items():
             crps_forecast_array = values['crps_forecast']
             crps_historical_array = values['crps_historical']
+            ae_forecast_array = values['absolute_errors_ml']
+            ae_naive_array = values['absolute_errors_naive']
             rmse_forecast = values['rmse_forecast']
             rmse_historical = values['rmse_historical']
             rmse_naive = values['rmse_naive']
@@ -152,6 +154,12 @@ def make_df_from_score_dict(score_dict):
             ] + [
                 (site_id, date, 'crps', 'historical', historical_crps_val, ts[i])
                 for i, historical_crps_val in enumerate(crps_historical_array)
+            ] + [
+                (site_id, date, 'ae', 'forecast', ae_forecast_val, ts[i])
+                for i, ae_forecast_val in enumerate(ae_forecast_array)
+            ] + [
+                (site_id, date, 'ae', 'naive', ae_naive_val, ts[i])
+                for i, ae_naive_val in enumerate(ae_naive_array)
             ] + [
                 (site_id, date, 'rmse', 'forecast', rmse_forecast, np.nan),
                 (site_id, date, 'rmse', 'historical', rmse_historical, np.nan),
@@ -279,13 +287,22 @@ def modify_score_dict(csv, targets_df, target_variable, site_id, suffix, score_d
         rmse(filtered_validation_ts, filtered_forecasts[0][0]),
         rmse(filtered_validation_ts, filtered_forecasts[1][0])
     ]
+
+    # Need to find absolute error between ml/naive forecast and validation 
+    abs_errs = [
+        np.abs((filtered_validation_ts - filtered_forecasts[1][0]).values()),
+        np.abs((filtered_validation_ts - filtered_model_forecast.median()).values())
+    ]
+    abs_errs = [arr[~np.isnan(arr)] for arr in abs_errs]
     
     crps_scores = crps(
             filtered_forecasts[0][0],
             filtered_validation_ts,
             observed_is_ts=True,
     )
-    
+
+    score_dict[time_str]["absolute_errors_naive"] = abs_errs[0]
+    score_dict[time_str]["absolute_errors_ml"] = abs_errs[1]
     score_dict[time_str]["rmse_historical"] = rmse_scores[0]
     score_dict[time_str]["rmse_naive"] = rmse_scores[1]
     crps_historical = crps_scores.pd_dataframe().values[:, 0]
@@ -330,22 +347,32 @@ def score_improvement_bysite(model, targets_df, target_variable, suffix=""):
     # to manipulate
     df = make_df_from_score_dict(score_dict)
     # Making dataframes to look at within and between forecast windows
-    intra_df = df.loc[df.metric == 'crps']
+    intra_df = df.loc[(df.metric == 'crps') | (df.metric == 'ae')]
     inter_df = df.drop('t', axis=1)
     
     # Looking within a forecast window
     # Filtering dataframe for forecast and historical data separately
-    forecast_df = intra_df[intra_df['model'] == 'forecast']
+    forecast_df_crps = intra_df[(intra_df['model'] == 'forecast') & (intra_df['metric'] == 'crps')]
+    forecast_df_ae = intra_df[(intra_df['model'] == 'forecast') & (intra_df['metric'] == 'ae')]
     historical_df = intra_df[intra_df['model'] == 'historical']
+    naive_df = intra_df[intra_df['model'] == 'naive']
     
     # Merging forecast and historical data on site_id, date, and t
-    intra_merged = pd.merge(forecast_df, historical_df, on=['site_id', 'date', 't'], suffixes=('_forecast', '_historical'))
+    intra_merged_crps = pd.merge(forecast_df_crps, historical_df, on=['site_id', 'date', 't'], suffixes=('_forecast', '_historical'))
+    intra_merged_ae = pd.merge(forecast_df_ae, naive_df, on=['site_id', 'date', 't'], suffixes=('_forecast', '_naive'))
 
-    # Finding the difference between the historical and ml model crps
-    intra_merged['value_difference'] = intra_merged['value_forecast'] - intra_merged['value_historical']
-    intra_merged = intra_merged[['site_id', 'date', 't', 'value_difference']]
-    intra_merged['model'] = model
+    # Finding the difference in absolute error between the models of interest
+    intra_merged_crps['value_difference'] = intra_merged_crps['value_forecast'] - intra_merged_crps['value_historical']
+    intra_merged_ae['value_difference'] = intra_merged_ae['value_forecast'] - intra_merged_ae['value_naive']
+    intra_merged_crps.rename(columns={'metric_forecast': 'metric'}, inplace=True)
+    intra_merged_ae.rename(columns={'metric_forecast': 'metric'}, inplace=True)
+    # Then tidying up and Merging
+    intra_merged_crps = intra_merged_crps[['site_id', 'date', 't', 'metric', 'value_difference']]
+    intra_merged_ae = intra_merged_ae[['site_id', 'date', 't', 'metric', 'value_difference']]
+    intra_merged = pd.merge(intra_merged_crps, intra_merged_ae, on=['site_id', 'date', 't'], suffixes=('_crps', '_ae'))
+    intra_merged = intra_merged[['site_id', 'date', 't', 'value_difference_crps', 'value_difference_ae']]
 
+    # Now, back to the inter-forecast window comparison
     # Using the mean CRPS score over the forecast horizon
     inter_df = inter_df.groupby(['site_id', 'date', 'metric', 'model']).mean().reset_index()
 
@@ -407,6 +434,7 @@ def score_improvement_bysite(model, targets_df, target_variable, suffix=""):
     merged_df = pd.merge(crps_merged, rmse_merged, on=['site_id', 'date'], how='inner')
     merged_df = merged_df.drop(merged_df.filter(like='metric').columns, axis=1)
     merged_df['model'] = model
+    intra_merged['model'] = model
 
     return merged_df, intra_merged
     
@@ -820,11 +848,14 @@ def plot_region_percentages(df_, metadata_df, title_name, historical=True):
     plt.tight_layout()
     plt.title(title_name)
 
-def plot_crps_over_time_agg(intra_df, title_name):
+def plot_crps_over_time_agg(intra_df, title_name, historical=True):
     plt.figure(figsize=(12, 8))
-
+    if historical:
+        metric = 'crps'
+    else:
+        metric = 'ae'
     # Group by 't' and 'model' and calculate the mean and percentiles
-    summary_df = intra_df.groupby(['t'])['value_difference'].agg([lambda x: x.quantile(0.05),
+    summary_df = intra_df.groupby(['t'])[f'value_difference_{metric}'].agg([lambda x: x.quantile(0.05),
                                                                   lambda x: x.quantile(0.5),
                                                                   lambda x: x.quantile(0.95)]).reset_index()
     
@@ -856,6 +887,9 @@ def plot_crps_over_time_agg(intra_df, title_name):
     ax.spines["bottom"].set_visible(True)
     plt.axhline(y=0, color='black', linestyle='dashed', linewidth=1)
     plt.legend(labels=['ML Model Aggregate'])
-    plt.ylabel("CRPS(ML Model) - CRPS(Climatology Model)")
+    if metric == 'ae':
+        plt.ylabel("AbsErr(ML Model) - AbsErr(Naive Persistence Model)")
+    elif metric == 'crps':
+        plt.ylabel("CRPS(ML Model) - CRPS(Climatology Model)")
     plt.title(title_name)
     plt.show()
