@@ -434,6 +434,7 @@ def score_improvement_bysite(model, targets_df, target_variable, suffix=""):
     merged_df = pd.merge(crps_merged, rmse_merged, on=['site_id', 'date'], how='inner')
     merged_df = merged_df.drop(merged_df.filter(like='metric').columns, axis=1)
     merged_df['model'] = model
+    intra_merged['model'] = model
 
     return merged_df, intra_merged
     
@@ -847,8 +848,12 @@ def plot_region_percentages(df_, metadata_df, title_name, historical=True):
     plt.tight_layout()
     plt.title(title_name)
 
-def plot_crps_over_time_agg(intra_df, title_name, metric):
+def plot_crps_over_time_agg(intra_df, title_name, historical=True):
     plt.figure(figsize=(12, 8))
+    if historical:
+        metric = 'crps'
+    else:
+        metric = 'ae'
     # Group by 't' and 'model' and calculate the mean and percentiles
     summary_df = intra_df.groupby(['t'])[f'value_difference_{metric}'].agg([lambda x: x.quantile(0.05),
                                                                   lambda x: x.quantile(0.5),
